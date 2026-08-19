@@ -14,7 +14,7 @@
 
 <br/>
 
-> Форк [ZapretTester](https://github.com/bpm500/ZapretTester) с минималистичным чёрно-белым интерфейсом.  
+> Форк [ZapretTester](https://github.com/bpm500/ZapretTester).  
 > Подключение в один клик, автоматический подбор рабочей стратегии, тест всех конфигов, автозапуск с Windows.
 
 </div>
