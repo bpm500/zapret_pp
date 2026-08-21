@@ -2,30 +2,51 @@
 zapret++ — DPI Bypass Manager
 Fork of ZapretTester | Minimalist B&W UI
 """
-
-import sys
+import ctypes
+import json
 import os
+import random
+import socket
+import ssl
 import subprocess
+import sys
 import threading
 import time
-import json
-import ctypes
 import winreg
-import random
-import psutil
-import requests
-import ping3
 from pathlib import Path
+from urllib.parse import urlparse
 
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QListWidget, QListWidgetItem, QCheckBox,
-    QTextEdit, QSystemTrayIcon, QMenu, QSizePolicy, QSpacerItem
-)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
+import psutil
+from PyQt6.QtCore import QSize, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import (
-    QIcon, QPixmap, QColor, QPalette, QImage,
-    QPainter, QBrush, QPen, QCursor, QAction, QFont
+    QAction,
+    QBrush,
+    QColor,
+    QCursor,
+    QFont,
+    QIcon,
+    QImage,
+    QPainter,
+    QPalette,
+    QPen,
+    QPixmap,
+)
+from PyQt6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMenu,
+    QPushButton,
+    QSizePolicy,
+    QSpacerItem,
+    QSystemTrayIcon,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
 )
 
 # ══════════════════════════════════════════════════════════════════
@@ -33,7 +54,7 @@ from PyQt6.QtGui import (
 # ══════════════════════════════════════════════════════════════════
 
 APP_NAME = "zapret++"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 WINDOW_W, WINDOW_H = 800, 600  # 4:3
 
 # ══════════════════════════════════════════════════════════════════
@@ -138,10 +159,80 @@ def _is_winws_running() -> bool:
     return False
 
 
-def _test_url(url: str) -> bool:
+_TEST_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def _probe(url: str, timeout: float = 6.0, retries: int = 2):
+    """
+    Реальная проверка DPI-обхода: сырой TCP-коннект + TLS handshake
+    с нужным SNI, затем минимальный HTTP-запрос напрямую по сокету.
+
+    Успех = получен ЛЮБОЙ валидный HTTP-ответ (даже 403/404/редирект).
+    Если DPI блокирует — соединение оборвётся ДО этого момента
+    (RST на ClientHello / timeout). Сам факт полученного HTTP-ответа
+    уже доказывает, что обход сработал — status_code == 200 тут
+    неверный критерий, сайт может отдать что угодно вне зависимости
+    от DPI (редирект, анти-бот, гео-страницу).
+
+    Возвращает (ok, latency_ms, resolved_ip):
+      - latency_ms — реальное время TCP+TLS хендшейка до самого
+        тестируемого сервиса (как меряют VPN-клиенты вроде v2rayN/Happ),
+        а не ICMP-пинг до постороннего хоста.
+      - resolved_ip — IP, в который зарезолвился хост (для диагностики
+        DNS-подмены/throttling, если сервис стабильно недоступен).
+    """
+    parsed = urlparse(url)
+    host = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+    if not host:
+        return False, None, None
+
+    resolved_ip = None
     try:
-        r = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
-        return r.status_code == 200
+        resolved_ip = socket.gethostbyname(host)
+    except Exception:
+        pass  # DNS не резолвится вообще — тоже важный диагностический факт
+
+    for attempt in range(retries):
+        start = time.perf_counter()
+        try:
+            with socket.create_connection((host, port), timeout=timeout) as raw:
+                if parsed.scheme == "https":
+                    ctx = ssl.create_default_context()
+                    with ctx.wrap_socket(raw, server_hostname=host) as sock:
+                        if _http_probe_ok(sock, host, path, timeout):
+                            elapsed_ms = int((time.perf_counter() - start) * 1000)
+                            return True, elapsed_ms, resolved_ip
+                else:
+                    if _http_probe_ok(raw, host, path, timeout):
+                        elapsed_ms = int((time.perf_counter() - start) * 1000)
+                        return True, elapsed_ms, resolved_ip
+        except Exception:
+            pass
+        if attempt < retries - 1:
+            time.sleep(0.5)
+    return False, None, resolved_ip
+
+
+def _http_probe_ok(sock, host: str, path: str, timeout: float) -> bool:
+    try:
+        sock.settimeout(timeout)
+        req = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"User-Agent: {_TEST_UA}\r\n"
+            f"Accept: */*\r\n"
+            f"Connection: close\r\n\r\n"
+        ).encode()
+        sock.sendall(req)
+        data = sock.recv(512)
+        return data[:5] == b"HTTP/"
     except Exception:
         return False
 
@@ -559,11 +650,6 @@ class TestWorker(QThread):
 
     def run(self):
         results = []
-        ping_targets = {
-            "Discord": "discord.com",
-            "YouTube": "youtube.com",
-            "Yandex": "yandex.com",
-        }
 
         self.log.emit("━" * 45, "dim")
         self.log.emit(f"  Testing {len(self.bat_files)} configs...", "white")
@@ -585,42 +671,33 @@ class TestWorker(QThread):
 
                 self.log.emit("  Starting config...", "dim")
                 _run_bat_admin(bat_path)
-                time.sleep(3)
+                time.sleep(5)
                 if self._stop:
                     _kill_winws()
                     break
 
                 res = {"name": bat_file, "services": {}, "pings": {}, "avg": 0}
 
-                # Service checks (priority!)
-                for svc, url in [("YouTube", "https://www.youtube.com"),
-                                 ("Discord", "https://discord.com")]:
+                # Проверка доступности + реальная задержка TCP+TLS
+                # хендшейка одним проходом (вместо ICMP ping3 до
+                # постороннего хоста — этот метод точнее показывает,
+                # реально ли доступен именно тестируемый сервис)
+                for svc, url in [("YouTube", "https://www.youtube.com/generate_204"),
+                                  ("Discord", "https://discord.com/api/v9/gateway")]:
                     if self._stop:
                         break
-                    ok = _test_url(url)
+                    ok, latency_ms, ip = _probe(url)
                     res["services"][svc] = ok
+                    res["pings"][svc] = latency_ms if latency_ms is not None else 999
                     mark = "✓" if ok else "✗"
-                    self.log.emit(f"    {svc}: {mark}", "white" if ok else "dim")
+                    extra = f" ({latency_ms} ms, ip={ip})" if ok else f" (DNS/connect fail, ip={ip or '?'})"
+                    self.log.emit(f"    {svc}: {mark}{extra}", "white" if ok else "dim")
 
                 if self._stop:
                     _kill_winws()
                     break
 
-                # Ping checks
-                ping_vals = []
-                for svc, host in ping_targets.items():
-                    if self._stop:
-                        break
-                    try:
-                        d = ping3.ping(host, timeout=3)
-                        ms = int(d * 1000) if d else 999
-                    except Exception:
-                        ms = 999
-                    res["pings"][svc] = ms
-                    ping_vals.append(ms)
-                    self.log.emit(f"    {svc} ping: {ms} ms", "dim")
-
-                valid = [p for p in ping_vals if p < 999]
+                valid = [v for v in res["pings"].values() if v < 999]
                 res["avg"] = sum(valid) / len(valid) if valid else 999
                 results.append(res)
 
@@ -940,9 +1017,11 @@ class CreateWorker(QThread):
     success = pyqtSignal(str)  # filename of created bat
     finished = pyqtSignal()
 
-    def __init__(self, zapret_dir: Path):
+    def __init__(self, zapret_dir: Path, target_discord: bool = True, target_youtube: bool = True):
         super().__init__()
         self.zapret_dir = zapret_dir
+        self.target_discord = target_discord
+        self.target_youtube = target_youtube
         self._stop = False
 
     def stop(self):
@@ -952,6 +1031,12 @@ class CreateWorker(QThread):
         self.log.emit("━" * 45, "dim")
         self.log.emit("  Route creation started", "white")
         self.log.emit("━" * 45, "dim")
+        targets = []
+        if self.target_discord:
+            targets.append("Discord")
+        if self.target_youtube:
+            targets.append("YouTube")
+        self.log.emit(f"  Target(s): {', '.join(targets)}", "dim")
 
         # Shuffle strategies for randomness
         strats = list(STRATEGIES)
@@ -990,7 +1075,7 @@ class CreateWorker(QThread):
                 continue
 
             # Wait for winws to start
-            time.sleep(4)
+            time.sleep(6)
 
             if self._stop:
                 _kill_winws()
@@ -1008,10 +1093,16 @@ class CreateWorker(QThread):
                     pass
                 continue
 
-            # Test connectivity
-            self.log.emit("  Testing Discord...", "dim")
-            discord_ok = _test_url("https://discord.com")
-            self.log.emit(f"    Discord: {'✓' if discord_ok else '✗'}", "white" if discord_ok else "dim")
+            # Test connectivity — только по выбранным пользователем целям.
+            # Цель, которая не выбрана, не тестируется и не влияет на успех.
+            discord_ok = True
+            youtube_ok = True
+
+            if self.target_discord:
+                self.log.emit("  Testing Discord...", "dim")
+                discord_ok, _, discord_ip = _probe("https://discord.com/api/v9/gateway")
+                self.log.emit(f"    Discord: {'✓' if discord_ok else '✗'} (ip={discord_ip or '?'})",
+                              "white" if discord_ok else "dim")
 
             if self._stop:
                 _kill_winws()
@@ -1021,9 +1112,11 @@ class CreateWorker(QThread):
                     pass
                 break
 
-            self.log.emit("  Testing YouTube...", "dim")
-            youtube_ok = _test_url("https://www.youtube.com")
-            self.log.emit(f"    YouTube: {'✓' if youtube_ok else '✗'}", "white" if youtube_ok else "dim")
+            if self.target_youtube:
+                self.log.emit("  Testing YouTube...", "dim")
+                youtube_ok, _, youtube_ip = _probe("https://www.youtube.com/generate_204")
+                self.log.emit(f"    YouTube: {'✓' if youtube_ok else '✗'} (ip={youtube_ip or '?'})",
+                              "white" if youtube_ok else "dim")
 
             _kill_winws()
             time.sleep(0.5)
@@ -1378,6 +1471,22 @@ class MainWindow(QMainWindow):
         left_lay.addWidget(lbl)
         left_lay.addSpacing(8)
 
+        target_lbl = QLabel("TARGETS")
+        target_lbl.setObjectName("sectionLbl")
+        left_lay.addWidget(target_lbl)
+
+        target_row = QHBoxLayout()
+        target_row.setSpacing(20)
+        self._chk_target_discord = QCheckBox("Discord")
+        self._chk_target_discord.setChecked(True)
+        self._chk_target_youtube = QCheckBox("YouTube")
+        self._chk_target_youtube.setChecked(True)
+        target_row.addWidget(self._chk_target_discord)
+        target_row.addWidget(self._chk_target_youtube)
+        target_row.addStretch()
+        left_lay.addLayout(target_row)
+        left_lay.addSpacing(10)
+
         self._btn_create_route = QPushButton("Create Route")
         self._btn_create_route.setObjectName("createBtn")
         self._btn_create_route.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
@@ -1695,7 +1804,7 @@ class MainWindow(QMainWindow):
         state = "Connected" if self._connected else "Disconnected"
         col = "#888" if self._connected else "#333"
         admin = "Admin ✓" if is_admin() else "No admin"
-        self._status_bar.setText(f"  {dot} {state}   ·   {admin}   ·   {APP_NAME} v{APP_VERSION}")
+        self._status_bar.setText(f"  {dot} {state}   ·   {admin}   ·   {APP_NAME} v{APP_VERSION}   ·   @bpm500")
         self._status_bar.setStyleSheet(
             f"background: #060606; color: {col}; font-size: 11px; "
             f"border-top: 1px solid #111; padding: 0 14px;"
@@ -1793,10 +1902,18 @@ class MainWindow(QMainWindow):
             self._create_log("winws.exe not found in zapret directory!", "white")
             return
 
+        target_discord = self._chk_target_discord.isChecked()
+        target_youtube = self._chk_target_youtube.isChecked()
+        if not target_discord and not target_youtube:
+            self._create_log("Select at least one target: Discord or YouTube!", "white")
+            return
+
         self._btn_create_route.setEnabled(False)
         self._btn_create_stop.setVisible(True)
+        self._chk_target_discord.setEnabled(False)
+        self._chk_target_youtube.setEnabled(False)
 
-        self._create_worker = CreateWorker(self._zapret_dir)
+        self._create_worker = CreateWorker(self._zapret_dir, target_discord, target_youtube)
         self._create_worker.log.connect(self._create_log)
         self._create_worker.success.connect(self._on_create_success)
         self._create_worker.finished.connect(self._on_create_done)
@@ -1817,6 +1934,8 @@ class MainWindow(QMainWindow):
         self._btn_create_stop.setVisible(False)
         self._btn_create_stop.setEnabled(True)
         self._btn_create_stop.setText("Stop")
+        self._chk_target_discord.setEnabled(True)
+        self._chk_target_youtube.setEnabled(True)
 
     def _create_log(self, text: str, color: str = "white"):
         COLORS = {
