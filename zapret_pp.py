@@ -42,11 +42,18 @@ from PyQt6.QtWidgets import (
     QMenu,
     QPushButton,
     QSizePolicy,
+    QSlider,
     QSpacerItem,
     QSystemTrayIcon,
     QTextEdit,
     QVBoxLayout,
     QWidget,
+)
+from autostart import (
+    disable_autostart,
+    enable_autostart,
+    get_executable_path,
+    is_autostart_enabled,
 )
 
 # ══════════════════════════════════════════════════════════════════
@@ -54,7 +61,7 @@ from PyQt6.QtWidgets import (
 # ══════════════════════════════════════════════════════════════════
 
 APP_NAME = "zapret++"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 WINDOW_W, WINDOW_H = 800, 600  # 4:3
 
 # ══════════════════════════════════════════════════════════════════
@@ -631,109 +638,211 @@ class ConnectWorker(QThread):
 
 
 # ══════════════════════════════════════════════════════════════════
-#  TEST WORKER (fixed sorting: services > ping)
+#  TEST WORKERS — test selected config or test all configs
 # ══════════════════════════════════════════════════════════════════
 
-class TestWorker(QThread):
+class TestSelectedWorker(QThread):
     log = pyqtSignal(str, str)
     result = pyqtSignal(str)
     finished = pyqtSignal()
 
-    def __init__(self, bat_files: list, zapret_dir: Path):
+    def __init__(self, zapret_dir: Path, bat_file: str, was_connected: bool):
         super().__init__()
-        self.bat_files = bat_files
         self.zapret_dir = zapret_dir
+        self.bat_file = bat_file
+        self.was_connected = was_connected
         self._stop = False
 
     def stop(self):
         self._stop = True
 
     def run(self):
-        results = []
+        p_name = self.bat_file
+        self.log.emit("━" * 45, "dim")
+        self.log.emit(f"  Testing config: {p_name}", "white")
+        self.log.emit("━" * 45, "dim")
 
+        need_kill_when_done = False
+        if not _is_winws_running() or not self.was_connected:
+            _kill_winws()
+            time.sleep(0.5)
+            if self._stop:
+                self.finished.emit()
+                return
+
+            bat_path = self.zapret_dir / self.bat_file
+            try:
+                _run_bat_admin(bat_path)
+                need_kill_when_done = True
+                for _ in range(20):
+                    if _is_winws_running():
+                        break
+                    time.sleep(0.15)
+                time.sleep(0.5)
+            except Exception as e:
+                self.log.emit(f"  Failed to start config: {e}", "white")
+                self.finished.emit()
+                return
+
+        services = [
+            ("Discord", "https://discord.com/api/v9/gateway"),
+            ("YouTube", "https://www.youtube.com/generate_204"),
+        ]
+
+        results = {}
+        for svc, url in services:
+            if self._stop:
+                break
+            self.log.emit(f"  Probing {svc}...", "dim")
+            ok, latency_ms, ip = _probe(url, timeout=4.0, retries=2)
+            results[svc] = (ok, latency_ms, ip)
+            mark = "✓" if ok else "✗"
+            extra = f" ({latency_ms} ms, ip={ip})" if ok else f" (fail, ip={ip or '?'})"
+            self.log.emit(f"    {svc}: {mark}{extra}", "white" if ok else "dim")
+
+        if need_kill_when_done and not self.was_connected:
+            _kill_winws()
+
+        if self._stop:
+            self.log.emit("\n⛔  Test stopped.", "white")
+        else:
+            ok_count = sum(1 for ok, _, _ in results.values() if ok)
+            self.log.emit(f"\n  Config '{p_name}': {ok_count}/{len(results)} services OK.", "white")
+
+            lines = ["━" * 45, f"  CONFIG: {p_name}", "━" * 45]
+            for svc, (ok, lat, ip) in results.items():
+                status = "✓ OK" if ok else "✗ BLOCKED"
+                lines.append(f"  {svc}: {status} — {lat or '?'} ms (IP: {ip or '?'})")
+            self.result.emit("\n".join(lines))
+
+        self.finished.emit()
+
+
+class TestWorker(QThread):
+    log = pyqtSignal(str, str)
+    result = pyqtSignal(str)
+    ranked = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, bat_files: list, zapret_dir: Path, was_connected: bool = False):
+        super().__init__()
+        self.bat_files = list(bat_files)
+        self.zapret_dir = zapret_dir
+        self.was_connected = was_connected
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        total = len(self.bat_files)
         self.log.emit("━" * 45, "dim")
-        self.log.emit(f"  Testing {len(self.bat_files)} configs...", "white")
+        self.log.emit(f"  Testing all {total} configs...", "white")
         self.log.emit("━" * 45, "dim")
+
+        services = [
+            ("Discord", "https://discord.com/api/v9/gateway"),
+            ("YouTube", "https://www.youtube.com/generate_204"),
+        ]
+
+        scored_configs = []
 
         for idx, bat_file in enumerate(self.bat_files):
             if self._stop:
                 break
 
             bat_path = self.zapret_dir / bat_file
-            self.log.emit(f"\n▶ [{idx+1}/{len(self.bat_files)}] {bat_file}", "white")
+            self.log.emit(f"\n▶ [{idx+1}/{total}] {bat_file}", "white")
+
+            _kill_winws()
+            time.sleep(0.5)
+
+            if self._stop:
+                break
 
             try:
-                self.log.emit("  Stopping old processes...", "dim")
-                _kill_winws()
-                time.sleep(1)
-                if self._stop:
-                    break
-
-                self.log.emit("  Starting config...", "dim")
                 _run_bat_admin(bat_path)
-                time.sleep(5)
-                if self._stop:
-                    _kill_winws()
-                    break
+                for _ in range(20):
+                    if _is_winws_running():
+                        break
+                    time.sleep(0.15)
+                time.sleep(0.5)
 
-                res = {"name": bat_file, "services": {}, "pings": {}, "avg": 0}
+                if not _is_winws_running():
+                    self.log.emit("    winws failed to start, skipping...", "dim")
+                    scored_configs.append((bat_file, 0, 99999))
+                    continue
 
-                # Проверка доступности + реальная задержка TCP+TLS
-                # хендшейка одним проходом (вместо ICMP ping3 до
-                # постороннего хоста — этот метод точнее показывает,
-                # реально ли доступен именно тестируемый сервис)
-                for svc, url in [("YouTube", "https://www.youtube.com/generate_204"),
-                                  ("Discord", "https://discord.com/api/v9/gateway")]:
+                # Probe services
+                ok_count = 0
+                latencies = []
+
+                for svc, url in services:
                     if self._stop:
                         break
-                    ok, latency_ms, ip = _probe(url)
-                    res["services"][svc] = ok
-                    res["pings"][svc] = latency_ms if latency_ms is not None else 999
+                    ok, lat, ip = _probe(url, timeout=3.5, retries=1)
+                    if ok:
+                        ok_count += 1
+                        if lat:
+                            latencies.append(lat)
                     mark = "✓" if ok else "✗"
-                    extra = f" ({latency_ms} ms, ip={ip})" if ok else f" (DNS/connect fail, ip={ip or '?'})"
+                    extra = f" ({lat} ms)" if ok and lat else ""
                     self.log.emit(f"    {svc}: {mark}{extra}", "white" if ok else "dim")
 
-                if self._stop:
-                    _kill_winws()
-                    break
-
-                valid = [v for v in res["pings"].values() if v < 999]
-                res["avg"] = sum(valid) / len(valid) if valid else 999
-                results.append(res)
-
-                _kill_winws()
-                time.sleep(1)
+                avg_lat = int(sum(latencies) / len(latencies)) if latencies else 9999
+                scored_configs.append((bat_file, ok_count, avg_lat))
 
             except Exception as e:
-                self.log.emit(f"  Error: {e}", "white")
+                self.log.emit(f"    Error: {e}", "white")
+                scored_configs.append((bat_file, 0, 99999))
+            finally:
                 _kill_winws()
 
         if self._stop:
-            _kill_winws()
-            self.log.emit("\n⛔  Tests stopped by user.", "white")
-        else:
-            if results:
-                self._show_top(results)
-            self.log.emit("\n✅  All tests completed.", "white")
+            self.log.emit("\n⛔  Testing all configs stopped.", "white")
+            self.finished.emit()
+            return
 
-        self.finished.emit()
+        # Sort: highest ok_count first, then lowest avg_lat
+        scored_configs.sort(key=lambda x: (x[1], -x[2]), reverse=True)
 
-    def _show_top(self, results):
-        # FIX: services count is the primary sort key, avg ping is secondary
-        srt = sorted(
-            results,
-            key=lambda x: (-sum(x["services"].values()), x["avg"])
-        )[:3]
+        # Assign top_rank (1, 2, 3) ONLY to working configs (ok_count > 0)
+        working_count = 0
+        ranked_dict = {}
+        for b_name, ok_c, _ in scored_configs:
+            if ok_c > 0 and working_count < 3:
+                working_count += 1
+                ranked_dict[b_name] = working_count
 
-        lines = ["\n" + "━" * 45, "  TOP 3 RESULTS", "━" * 45]
-        for i, r in enumerate(srt, 1):
-            av = sum(r["services"].values())
-            total = len(r["services"])
-            lines.append(f"\n{i}. {r['name']}")
-            lines.append(f"   Services: {av}/{total}  |  Avg ping: {r['avg']:.0f} ms")
-            for k, v in r["pings"].items():
-                lines.append(f"   {k}: {v} ms")
+        sorted_bat_files = [item[0] for item in scored_configs]
+
+        # Build ranking report
+        lines = [
+            "━" * 45,
+            "  TOP CONFIGS RANKING",
+            "━" * 45,
+        ]
+        medals = ["🥇", "🥈", "🥉"]
+        medal_idx = 0
+        for rank, (b_name, ok_c, avg_l) in enumerate(scored_configs):
+            lat_str = f"{avg_l} ms" if avg_l < 9000 else "timeout"
+            if ok_c > 0:
+                prefix = medals[medal_idx] if medal_idx < 3 else f" {rank+1}."
+                medal_idx += 1
+                lines.append(f"{prefix} {b_name} — {ok_c}/{len(services)} OK (avg {lat_str})")
+            else:
+                lines.append(f" ✗ {b_name} — 0/{len(services)} OK (blocked)")
+
         self.result.emit("\n".join(lines))
+        self.log.emit("\n" + "\n".join(lines), "white")
+        if working_count > 0:
+            count_str = f"Top {working_count}" if working_count > 1 else "1 working"
+            self.log.emit(f"\n🏆 {count_str} config(s) placed on the left!", "white")
+        else:
+            self.log.emit("\n⚠  No working configs found.", "white")
+
+        self.ranked.emit(json.dumps({"sorted": sorted_bat_files, "ranks": ranked_dict}))
+        self.finished.emit()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1017,11 +1126,12 @@ class CreateWorker(QThread):
     success = pyqtSignal(str)  # filename of created bat
     finished = pyqtSignal()
 
-    def __init__(self, zapret_dir: Path, target_discord: bool = True, target_youtube: bool = True):
+    def __init__(self, zapret_dir: Path, target_discord: bool = True, target_youtube: bool = True, num_configs: int = 1):
         super().__init__()
         self.zapret_dir = zapret_dir
         self.target_discord = target_discord
         self.target_youtube = target_youtube
+        self.num_configs = num_configs
         self._stop = False
 
     def stop(self):
@@ -1029,7 +1139,7 @@ class CreateWorker(QThread):
 
     def run(self):
         self.log.emit("━" * 45, "dim")
-        self.log.emit("  Route creation started", "white")
+        self.log.emit(f"  Route creation started ({self.num_configs} config(s) requested)", "white")
         self.log.emit("━" * 45, "dim")
         targets = []
         if self.target_discord:
@@ -1041,6 +1151,8 @@ class CreateWorker(QThread):
         # Shuffle strategies for randomness
         strats = list(STRATEGIES)
         random.shuffle(strats)
+
+        created_count = 0
 
         for idx, (name, args) in enumerate(strats):
             if self._stop:
@@ -1075,7 +1187,10 @@ class CreateWorker(QThread):
                 continue
 
             # Wait for winws to start
-            time.sleep(6)
+            for _ in range(15):
+                if _is_winws_running():
+                    break
+                time.sleep(0.4)
 
             if self._stop:
                 _kill_winws()
@@ -1093,14 +1208,13 @@ class CreateWorker(QThread):
                     pass
                 continue
 
-            # Test connectivity — только по выбранным пользователем целям.
-            # Цель, которая не выбрана, не тестируется и не влияет на успех.
+            # Test connectivity — only user-selected targets
             discord_ok = True
             youtube_ok = True
 
             if self.target_discord:
                 self.log.emit("  Testing Discord...", "dim")
-                discord_ok, _, discord_ip = _probe("https://discord.com/api/v9/gateway")
+                discord_ok, _, discord_ip = _probe("https://discord.com/api/v9/gateway", timeout=4.0, retries=2)
                 self.log.emit(f"    Discord: {'✓' if discord_ok else '✗'} (ip={discord_ip or '?'})",
                               "white" if discord_ok else "dim")
 
@@ -1114,7 +1228,7 @@ class CreateWorker(QThread):
 
             if self.target_youtube:
                 self.log.emit("  Testing YouTube...", "dim")
-                youtube_ok, _, youtube_ip = _probe("https://www.youtube.com/generate_204")
+                youtube_ok, _, youtube_ip = _probe("https://www.youtube.com/generate_204", timeout=4.0, retries=2)
                 self.log.emit(f"    YouTube: {'✓' if youtube_ok else '✗'} (ip={youtube_ip or '?'})",
                               "white" if youtube_ok else "dim")
 
@@ -1122,7 +1236,7 @@ class CreateWorker(QThread):
             time.sleep(0.5)
 
             if discord_ok and youtube_ok:
-                # Success! Save the bat file permanently
+                created_count += 1
                 custom_num = 1
                 while (self.zapret_dir / f"custom_{custom_num}.bat").exists():
                     custom_num += 1
@@ -1138,13 +1252,13 @@ class CreateWorker(QThread):
                     except Exception:
                         pass
 
-                self.log.emit(f"\n✅  Route created: {final_name}", "white")
+                self.log.emit(f"\n✅  Working config #{created_count}/{self.num_configs} found: {final_name}", "white")
                 self.log.emit(f"  Strategy: {name}", "dim")
                 self.success.emit(final_name)
-                self.finished.emit()
-                return
+
+                if created_count >= self.num_configs:
+                    break
             else:
-                # Clean up temp file
                 try:
                     tmp_bat.unlink()
                 except Exception:
@@ -1155,8 +1269,10 @@ class CreateWorker(QThread):
 
         if self._stop:
             self.log.emit("\n⛔  Route creation stopped.", "white")
-        else:
+        elif created_count == 0:
             self.log.emit("\n✗  All strategies exhausted. No working route found.", "white")
+        else:
+            self.log.emit(f"\n✅  Finished. Created {created_count}/{self.num_configs} route(s).", "white")
 
         self.finished.emit()
 
@@ -1183,7 +1299,9 @@ class MainWindow(QMainWindow):
         self._connected = False
         self._bat_files: list[str] = []
         self._current_bat: str | None = None
+        self._bat_ranks: dict[str, int] = {}
         self._test_worker: TestWorker | None = None
+        self._test_selected_worker: TestSelectedWorker | None = None
         self._create_worker: CreateWorker | None = None
         self._connect_worker: ConnectWorker | None = None
         self._dark_applied = False
@@ -1276,23 +1394,35 @@ class MainWindow(QMainWindow):
             pass
 
     def _apply_auto_start(self):
-        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-        name = APP_NAME
+        # Clean up legacy Run registry entry if present
         try:
             key = winreg.OpenKey(
-                winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE
+                winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE
             )
-            if self._auto_start:
-                exe = sys.executable if hasattr(sys, "frozen") else sys.argv[0]
-                winreg.SetValueEx(key, name, 0, winreg.REG_SZ, f'"{exe}"')
-            else:
-                try:
-                    winreg.DeleteValue(key, name)
-                except FileNotFoundError:
-                    pass
+            try:
+                winreg.DeleteValue(key, APP_NAME)
+            except FileNotFoundError:
+                pass
             winreg.CloseKey(key)
         except Exception:
             pass
+
+        # Apply Task Scheduler autostart
+        if self._auto_start:
+            enable_autostart()
+        else:
+            disable_autostart()
+
+    def _sync_autostart_ui(self):
+        """Dynamically sync checkbox with real Windows Task Scheduler state."""
+        if hasattr(self, "_chk_autostart"):
+            real_state = is_autostart_enabled()
+            self._chk_autostart.blockSignals(True)
+            self._chk_autostart.setChecked(real_state)
+            self._chk_autostart.blockSignals(False)
+            if self._auto_start != real_state:
+                self._auto_start = real_state
+                self._save_settings()
 
     # ── UI Build ──────────────────────────────────────────────────
 
@@ -1356,6 +1486,7 @@ class MainWindow(QMainWindow):
             b.setProperty("active", "true" if i == idx else "false")
             b.style().unpolish(b)
             b.style().polish(b)
+        self._sync_autostart_ui()
 
     # ══════════════════════════════════════════════════════════════
     #  CONNECT PAGE — list left, power button right
@@ -1380,6 +1511,8 @@ class MainWindow(QMainWindow):
 
         self._config_list = QListWidget()
         self._config_list.currentItemChanged.connect(self._on_list_changed)
+        self._config_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._config_list.customContextMenuRequested.connect(self._on_config_context_menu)
         left_lay.addWidget(self._config_list, 1)
 
         hlay.addWidget(left, 38)
@@ -1487,6 +1620,67 @@ class MainWindow(QMainWindow):
         left_lay.addLayout(target_row)
         left_lay.addSpacing(10)
 
+        # Number of configs slider
+        self._lbl_num_configs_title = QLabel("NUMBER OF CONFIGS: 1")
+        self._lbl_num_configs_title.setObjectName("sectionLbl")
+        left_lay.addWidget(self._lbl_num_configs_title)
+
+        slider_row = QHBoxLayout()
+        slider_row.setSpacing(8)
+
+        self._slider_num_configs = QSlider(Qt.Orientation.Horizontal)
+        self._slider_num_configs.setMinimum(1)
+        self._slider_num_configs.setMaximum(5)
+        self._slider_num_configs.setValue(1)
+        self._slider_num_configs.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self._slider_num_configs.setTickInterval(1)
+        self._slider_num_configs.setSingleStep(1)
+        self._slider_num_configs.setPageStep(1)
+        self._slider_num_configs.setFixedHeight(22)
+        self._slider_num_configs.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._slider_num_configs.setStyleSheet("""
+            QSlider::groove:horizontal {
+                background: #1a1a1a;
+                height: 4px;
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                background: #ffffff;
+                width: 14px;
+                height: 14px;
+                margin: -5px 0;
+                border-radius: 7px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #cccccc;
+            }
+            QSlider::sub-page:horizontal {
+                background: #888888;
+                border-radius: 2px;
+            }
+            QSlider::add-page:horizontal {
+                background: #1a1a1a;
+                border-radius: 2px;
+            }
+        """)
+
+        slider_row.addWidget(self._slider_num_configs, 1)
+        left_lay.addLayout(slider_row)
+
+        ticks_row = QHBoxLayout()
+        ticks_row.setContentsMargins(6, 0, 6, 0)
+        for val in ["1", "2", "3", "4", "5"]:
+            t_lbl = QLabel(val)
+            t_lbl.setStyleSheet("color: #555; font-size: 10px; font-weight: 600; background: transparent;")
+            t_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            ticks_row.addWidget(t_lbl)
+        left_lay.addLayout(ticks_row)
+
+        self._slider_num_configs.valueChanged.connect(
+            lambda v: self._lbl_num_configs_title.setText(f"NUMBER OF CONFIGS: {v}")
+        )
+        left_lay.addSpacing(10)
+
         self._btn_create_route = QPushButton("Create Route")
         self._btn_create_route.setObjectName("createBtn")
         self._btn_create_route.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
@@ -1571,13 +1765,23 @@ class MainWindow(QMainWindow):
 
         self._btn_test = QPushButton("Test All Configs")
         self._btn_test.setObjectName("testBtn")
+        self._btn_test.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_test.setToolTip("Test all configs and rank TOP 3 on the left")
         self._btn_test.setProperty("testing", "false")
         self._btn_test.clicked.connect(self._toggle_testing)
         left_lay.addWidget(self._btn_test)
 
+        self._btn_test_selected = QPushButton("Test Selected Config")
+        self._btn_test_selected.setObjectName("testBtn")
+        self._btn_test_selected.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_test_selected.setToolTip("Test connectivity of the currently selected config")
+        self._btn_test_selected.setProperty("testing", "false")
+        self._btn_test_selected.clicked.connect(self._toggle_test_selected)
+        left_lay.addWidget(self._btn_test_selected)
+
         self._btn_clear = QPushButton("Clear Log")
         self._btn_clear.setObjectName("actionBtn")
-        
+        self._btn_clear.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self._btn_clear.clicked.connect(self._console_clear)
         left_lay.addWidget(self._btn_clear)
 
@@ -1656,6 +1860,12 @@ class MainWindow(QMainWindow):
         self.raise_()
 
     def _exit_app(self):
+        if self._test_worker and self._test_worker.isRunning():
+            self._test_worker.stop()
+        if self._test_selected_worker and self._test_selected_worker.isRunning():
+            self._test_selected_worker.stop()
+        if self._create_worker and self._create_worker.isRunning():
+            self._create_worker.stop()
         self._disconnect()
         self._tray.hide()
         QApplication.quit()
@@ -1669,6 +1879,7 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, e):
         super().showEvent(e)
+        self._sync_autostart_ui()
         if not self._dark_applied:
             self._dark_applied = True
             try:
@@ -1688,25 +1899,50 @@ class MainWindow(QMainWindow):
     # ── BAT files ─────────────────────────────────────────────────
 
     def _load_bat_files(self):
-        self._bat_files = []
+        files_found = []
         if self._zapret_dir.exists():
             for f in sorted(self._zapret_dir.glob("*.bat")):
                 name_lower = f.name.lower()
                 # Skip service.bat and temp test files
                 if name_lower == "service.bat" or name_lower.startswith("_test_custom_"):
                     continue
-                self._bat_files.append(f.name)
+                files_found.append(f.name)
+
+        # Preserve ranking order if available
+        if hasattr(self, "_bat_files") and self._bat_files:
+            ordered = [f for f in self._bat_files if f in files_found]
+            for f in files_found:
+                if f not in ordered:
+                    ordered.append(f)
+            self._bat_files = ordered
+        else:
+            self._bat_files = files_found
 
         self._config_list.blockSignals(True)
         self._config_list.clear()
+
+        medals = {1: "🥇 ", 2: "🥈 ", 3: "🥉 "}
         for fname in self._bat_files:
-            item = QListWidgetItem(fname)
+            rank = self._bat_ranks.get(fname)
+            prefix = medals.get(rank, "")
+            item = QListWidgetItem(f"{prefix}{fname}")
+            if rank:
+                item.setToolTip(f"Top {rank} configuration")
+            item.setData(Qt.ItemDataRole.UserRole, fname)
             self._config_list.addItem(item)
 
         # Restore selection
-        if self._current_bat and self._current_bat in self._bat_files:
-            idx = self._bat_files.index(self._current_bat)
-            self._config_list.setCurrentRow(idx)
+        if self._current_bat:
+            found = False
+            for i in range(self._config_list.count()):
+                item = self._config_list.item(i)
+                if item.data(Qt.ItemDataRole.UserRole) == self._current_bat:
+                    self._config_list.setCurrentRow(i)
+                    found = True
+                    break
+            if not found and self._bat_files:
+                self._current_bat = self._bat_files[0]
+                self._config_list.setCurrentRow(0)
         elif self._bat_files:
             self._current_bat = self._bat_files[0]
             self._config_list.setCurrentRow(0)
@@ -1716,7 +1952,10 @@ class MainWindow(QMainWindow):
 
     def _on_list_changed(self, current, previous):
         if current:
-            text = current.text()
+            text = current.data(Qt.ItemDataRole.UserRole) or current.text()
+            for m in ["🥇 ", "🥈 ", "🥉 "]:
+                if text.startswith(m):
+                    text = text[len(m):]
             old_bat = self._current_bat
             self._current_bat = text
             self._save_settings()
@@ -1730,11 +1969,57 @@ class MainWindow(QMainWindow):
 
     def _update_selected_label(self):
         if self._current_bat:
-            # Show clean name without .bat extension
             name = self._current_bat.replace(".bat", "")
-            self._selected_lbl.setText(name)
+            rank = self._bat_ranks.get(self._current_bat)
+            medals = {1: "🥇 ", 2: "🥈 ", 3: "🥉 "}
+            prefix = medals.get(rank, "")
+            self._selected_lbl.setText(f"{prefix}{name}")
         else:
             self._selected_lbl.setText("No config selected")
+
+    def _on_config_context_menu(self, pos):
+        """Show context menu on right-click in config list."""
+        item = self._config_list.itemAt(pos)
+        if not item:
+            return
+        self._config_list.setCurrentItem(item)
+        fname = item.data(Qt.ItemDataRole.UserRole) or item.text()
+        for m in ["🥇 ", "🥈 ", "🥉 "]:
+            if fname.startswith(m):
+                fname = fname[len(m):]
+
+        menu = QMenu(self)
+        menu.setStyleSheet(STYLE)
+        clean_name = fname.replace(".bat", "")
+        delete_action = QAction(f'Delete "{clean_name}"', self)
+        delete_action.triggered.connect(lambda: self._delete_config(fname))
+        menu.addAction(delete_action)
+        menu.exec(self._config_list.mapToGlobal(pos))
+
+    def _delete_config(self, fname: str):
+        """Delete a .bat config file and reload list."""
+        bat_path = self._zapret_dir / fname
+        was_current = (self._current_bat == fname)
+        if was_current and self._connected:
+            self._disconnect()
+
+        try:
+            if bat_path.exists():
+                bat_path.unlink()
+        except Exception as e:
+            self._log(f"Error deleting {fname}: {e}", "white")
+            return
+
+        if fname in self._bat_files:
+            self._bat_files.remove(fname)
+        self._bat_ranks.pop(fname, None)
+
+        if was_current:
+            self._current_bat = self._bat_files[0] if self._bat_files else None
+            self._save_settings()
+
+        self._load_bat_files()
+        self._log(f"Deleted config: {fname}", "dim")
 
     # ── Connection (with pending state) ───────────────────────────
 
@@ -1813,10 +2098,24 @@ class MainWindow(QMainWindow):
     # ── Settings actions ──────────────────────────────────────────
 
     def _on_autostart_changed(self, v: bool):
-        self._auto_start = v
-        self._apply_auto_start()
-        self._save_settings()
-        self._log(f"Autostart {'enabled' if v else 'disabled'}", "dim")
+        if v:
+            success = enable_autostart()
+            if not success:
+                self._chk_autostart.blockSignals(True)
+                self._chk_autostart.setChecked(False)
+                self._chk_autostart.blockSignals(False)
+                self._auto_start = False
+                self._save_settings()
+                self._log("Failed to enable autostart (admin rights required)", "white")
+                return
+            self._auto_start = True
+            self._save_settings()
+            self._log("Autostart enabled via Task Scheduler", "dim")
+        else:
+            disable_autostart()
+            self._auto_start = False
+            self._save_settings()
+            self._log("Autostart disabled via Task Scheduler", "dim")
 
     def _on_autoconnect_changed(self, v: bool):
         self._auto_connect = v
@@ -1864,20 +2163,46 @@ class MainWindow(QMainWindow):
 
     def _start_testing(self):
         if not self._bat_files:
-            self._log("No .bat files found.", "white")
+            self._log("No .bat files found to test.", "white")
+            return
+        if self._test_selected_worker and self._test_selected_worker.isRunning():
+            self._log("Selected config test is already running. Please wait or stop it.", "dim")
             return
 
+        was_connected = self._connected
+        if self._connected:
+            self._disconnect()
+
         self._results.clear()
-        self._btn_test.setText("⛔  Stop Testing")
+        self._btn_test.setText("⛔  Stop Test All")
         self._btn_test.setProperty("testing", "true")
         self._btn_test.style().unpolish(self._btn_test)
         self._btn_test.style().polish(self._btn_test)
+        self._btn_test_selected.setEnabled(False)
 
-        self._test_worker = TestWorker(self._bat_files, self._zapret_dir)
+        self._test_worker = TestWorker(self._bat_files, self._zapret_dir, was_connected)
         self._test_worker.log.connect(self._log)
         self._test_worker.result.connect(self._results.setPlainText)
+        self._test_worker.ranked.connect(self._on_test_all_ranked)
         self._test_worker.finished.connect(self._on_test_done)
         self._test_worker.start()
+
+    def _on_test_all_ranked(self, ranked_json: str):
+        try:
+            data = json.loads(ranked_json)
+            self._bat_files = data.get("sorted", self._bat_files)
+            self._bat_ranks = data.get("ranks", {})
+
+            # Select top working config if available
+            top_working = next((f for f, r in self._bat_ranks.items() if r == 1), None)
+            if top_working:
+                self._current_bat = top_working
+            elif self._bat_files:
+                self._current_bat = self._bat_files[0]
+            self._save_settings()
+            self._load_bat_files()
+        except Exception as e:
+            self._log(f"Error updating config rankings: {e}", "white")
 
     def _on_test_done(self):
         self._btn_test.setText("Test All Configs")
@@ -1885,6 +2210,47 @@ class MainWindow(QMainWindow):
         self._btn_test.setProperty("testing", "false")
         self._btn_test.style().unpolish(self._btn_test)
         self._btn_test.style().polish(self._btn_test)
+        self._btn_test_selected.setEnabled(True)
+
+    def _toggle_test_selected(self):
+        if self._test_selected_worker and self._test_selected_worker.isRunning():
+            self._test_selected_worker.stop()
+            self._btn_test_selected.setEnabled(False)
+            self._btn_test_selected.setText("Stopping...")
+        else:
+            self._start_test_selected()
+
+    def _start_test_selected(self):
+        if not self._current_bat:
+            self._log("No config selected to test.", "white")
+            return
+        if self._test_worker and self._test_worker.isRunning():
+            self._log("All configs test is already running. Please wait or stop it.", "dim")
+            return
+
+        was_connected = self._connected
+        self._results.clear()
+        self._btn_test_selected.setText("⛔  Stop Test")
+        self._btn_test_selected.setProperty("testing", "true")
+        self._btn_test_selected.style().unpolish(self._btn_test_selected)
+        self._btn_test_selected.style().polish(self._btn_test_selected)
+        self._btn_test.setEnabled(False)
+
+        self._test_selected_worker = TestSelectedWorker(
+            self._zapret_dir, self._current_bat, was_connected
+        )
+        self._test_selected_worker.log.connect(self._log)
+        self._test_selected_worker.result.connect(self._results.setPlainText)
+        self._test_selected_worker.finished.connect(self._on_test_selected_done)
+        self._test_selected_worker.start()
+
+    def _on_test_selected_done(self):
+        self._btn_test_selected.setText("Test Selected Config")
+        self._btn_test_selected.setEnabled(True)
+        self._btn_test_selected.setProperty("testing", "false")
+        self._btn_test_selected.style().unpolish(self._btn_test_selected)
+        self._btn_test_selected.style().polish(self._btn_test_selected)
+        self._btn_test.setEnabled(True)
 
     # ── Create route ──────────────────────────────────────────────
 
@@ -1908,12 +2274,15 @@ class MainWindow(QMainWindow):
             self._create_log("Select at least one target: Discord or YouTube!", "white")
             return
 
+        num_configs = self._slider_num_configs.value()
+
         self._btn_create_route.setEnabled(False)
         self._btn_create_stop.setVisible(True)
         self._chk_target_discord.setEnabled(False)
         self._chk_target_youtube.setEnabled(False)
+        self._slider_num_configs.setEnabled(False)
 
-        self._create_worker = CreateWorker(self._zapret_dir, target_discord, target_youtube)
+        self._create_worker = CreateWorker(self._zapret_dir, target_discord, target_youtube, num_configs)
         self._create_worker.log.connect(self._create_log)
         self._create_worker.success.connect(self._on_create_success)
         self._create_worker.finished.connect(self._on_create_done)
@@ -1936,6 +2305,7 @@ class MainWindow(QMainWindow):
         self._btn_create_stop.setText("Stop")
         self._chk_target_discord.setEnabled(True)
         self._chk_target_youtube.setEnabled(True)
+        self._slider_num_configs.setEnabled(True)
 
     def _create_log(self, text: str, color: str = "white"):
         COLORS = {
@@ -1973,6 +2343,13 @@ class MainWindow(QMainWindow):
 # ══════════════════════════════════════════════════════════════════
 
 def main():
+    try:
+        app_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        if app_dir:
+            os.chdir(app_dir)
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setQuitOnLastWindowClosed(False)
