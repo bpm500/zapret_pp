@@ -35,7 +35,7 @@ echo.
 echo [1/3] Installing dependencies...
 echo.
 %PYCMD% -m pip install --upgrade pip
-%PYCMD% -m pip install PyQt6 pyinstaller psutil requests ping3
+%PYCMD% -m pip install -r requirements.txt
 if errorlevel 1 (
     echo.
     echo ERROR: Failed to install dependencies!
@@ -49,6 +49,12 @@ echo [2/3] Checking files...
 if not exist "zapret_pp.py" (
     echo ERROR: zapret_pp.py not found!
     echo Make sure you run this bat from the same folder as zapret_pp.py
+    pause
+    exit /b 1
+)
+if not exist "autostart.py" (
+    echo ERROR: autostart.py not found!
+    echo Make sure you run this bat from the same folder as autostart.py
     pause
     exit /b 1
 )
