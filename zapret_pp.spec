@@ -13,6 +13,8 @@ a = Analysis(
         ('icons/pending.png', 'icons'),
     ],
     hiddenimports=[
+        # App modules
+        'autostart',
         # PyQt6
         'PyQt6',
         'PyQt6.QtCore',
