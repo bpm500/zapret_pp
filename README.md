@@ -268,13 +268,6 @@ Zapret запускает драйвер `winws.exe`, который требу�
 
 </details>
 
----
-
-## 📄 Лицензия
-
-MIT License — см. файл [LICENSE](LICENSE)
-
----
 
 <div align="center">
 
