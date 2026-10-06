@@ -15,6 +15,27 @@ a = Analysis(
     hiddenimports=[
         # App modules
         'autostart',
+        'tg_proxy_service',
+        # Embedded tg-ws-proxy
+        'proxy',
+        'proxy.tg_ws_proxy',
+        'proxy.config',
+        'proxy.balancer',
+        'proxy.bridge',
+        'proxy.pool',
+        'proxy.raw_websocket',
+        'proxy.cf_h2',
+        'proxy.fake_tls',
+        'proxy.h2_transport',
+        'proxy.network_debug',
+        'proxy.stats',
+        'proxy.utils',
+        'proxy._aes',
+        'httpx',
+        'h2',
+        'hpack',
+        'hyperframe',
+        'cryptography',
         # PyQt6
         'PyQt6',
         'PyQt6.QtCore',
