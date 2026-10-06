@@ -16,7 +16,7 @@
 [![Python](https://img.shields.io/badge/Python-3.13%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
 [![PyQt6](https://img.shields.io/badge/PyQt6-GUI-41CD52?style=for-the-badge&logo=qt&logoColor=white)](https://pypi.org/project/PyQt6/)
 [![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-1.0.0-blue?style=for-the-badge)](https://github.com/bpm500/zapret_pp/releases)
+[![Version](https://img.shields.io/badge/Version-1.0.3-blue?style=for-the-badge)](https://github.com/bpm500/zapret_pp/releases)
 
 <br/>
 
