@@ -3,3 +3,7 @@ psutil>=5.9.0
 requests>=2.31.0
 ping3>=4.0.0
 pyinstaller>=6.0.0
+httpx[http2]>=0.28.0
+cryptography>=41.0.0
+
+
