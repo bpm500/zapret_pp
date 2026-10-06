@@ -58,6 +58,16 @@ if not exist "autostart.py" (
     pause
     exit /b 1
 )
+if not exist "tg_proxy_service.py" (
+    echo ERROR: tg_proxy_service.py not found!
+    pause
+    exit /b 1
+)
+if not exist "proxy\tg_ws_proxy.py" (
+    echo ERROR: proxy folder not found!
+    pause
+    exit /b 1
+)
 if not exist "zapret_pp.spec" (
     echo ERROR: zapret_pp.spec not found!
     pause
