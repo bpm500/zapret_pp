@@ -12,7 +12,6 @@
 
 **GUI-оболочка для Zapret — Discord, YouTube и другие заблокированные сервисы**
 
-[![Donate](https://img.shields.io/badge/Donate-DonationAlerts-FF5900?style=for-the-badge&logo=donationalerts&logoColor=white)](https://www.donationalerts.com/r/bpm500)
 [![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D4?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/bpm500/zapret_pp)
 [![Python](https://img.shields.io/badge/Python-3.13%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
 [![PyQt6](https://img.shields.io/badge/PyQt6-GUI-41CD52?style=for-the-badge&logo=qt&logoColor=white)](https://pypi.org/project/PyQt6/)
