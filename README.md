@@ -264,7 +264,7 @@ Zapret запускает драйвер `winws.exe`, который требу�
 <details>
 <summary><b>Как подключить Telegram к встроенному прокси?</b></summary>
 
-Перейдите во вкладку **Utils**, нажмите **Start Proxy**, затем нажмите **Open in Telegram** — Telegram Desktop автоматически откроет окно добавления прокси, где нужно нажать «Включить».
+Перейдите во вкладку **Utils**, нажмите **Start Proxy**, затем нажмите **Connect a Telegram proxy** — Telegram Desktop автоматически откроет окно добавления прокси, где нужно нажать «Включить».
 
 </details>
 
@@ -278,9 +278,6 @@ MIT License — см. файл [LICENSE](LICENSE)
 
 <div align="center">
 
-<a href="https://www.donationalerts.com/r/bpm500" target="_blank">
-  <img src="https://img.shields.io/badge/%D0%9F%D0%BE%D0%B4%D0%B4%D0%B5%D1%80%D0%B6%D0%BA%D0%B0_%D0%B0%D0%B2%D1%82%D0%BE%D1%80%D0%B0-DonationAlerts-FF5900?style=for-the-badge&logo=donationalerts&logoColor=white" alt="Поддержка автора DonationAlerts"/>
-</a>
 
 <br/><br/>
 
