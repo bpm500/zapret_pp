@@ -2,10 +2,13 @@
 zapret++ — DPI Bypass Manager
 Fork of ZapretTester | Minimalist B&W UI
 """
+from collections import Counter
 import ctypes
 import json
 import os
+import queue
 import random
+import re
 import socket
 import ssl
 import subprocess
@@ -36,11 +39,13 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMenu,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSlider,
     QSpacerItem,
@@ -55,13 +60,21 @@ from autostart import (
     get_executable_path,
     is_autostart_enabled,
 )
+from tg_proxy_service import (
+    CfProxyTestWorker,
+    CfWorkerTestWorker,
+    TgProxyManager,
+    coerce_domain_list,
+    default_tg_config,
+    validate_tg_settings,
+)
 
 # ══════════════════════════════════════════════════════════════════
 #  CONSTANTS
 # ══════════════════════════════════════════════════════════════════
 
 APP_NAME = "zapret++"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 WINDOW_W, WINDOW_H = 800, 600  # 4:3
 
 # ══════════════════════════════════════════════════════════════════
@@ -79,6 +92,14 @@ def get_app_dir() -> Path:
     if hasattr(sys, 'frozen'):
         return Path(sys.executable).parent
     return Path(__file__).parent
+
+
+def get_settings_dir(app_dir: Path | None = None) -> Path:
+    if app_dir is None:
+        app_dir = get_app_dir()
+    s_dir = app_dir / "settings"
+    s_dir.mkdir(parents=True, exist_ok=True)
+    return s_dir
 
 
 def is_admin() -> bool:
@@ -172,7 +193,7 @@ _TEST_UA = (
 )
 
 
-def _probe(url: str, timeout: float = 6.0, retries: int = 2):
+def _probe(url: str, timeout: float = 6.0, retries: int = 2, port_pool=None):
     """
     Реальная проверка DPI-обхода: сырой TCP-коннект + TLS handshake
     с нужным SNI, затем минимальный HTTP-запрос напрямую по сокету.
@@ -209,7 +230,7 @@ def _probe(url: str, timeout: float = 6.0, retries: int = 2):
     for attempt in range(retries):
         start = time.perf_counter()
         try:
-            with socket.create_connection((host, port), timeout=timeout) as raw:
+            with _open_connection(host, port, timeout, port_pool) as raw:
                 if parsed.scheme == "https":
                     ctx = ssl.create_default_context()
                     with ctx.wrap_socket(raw, server_hostname=host) as sock:
@@ -242,6 +263,276 @@ def _http_probe_ok(sock, host: str, path: str, timeout: float) -> bool:
         return data[:5] == b"HTTP/"
     except Exception:
         return False
+
+
+# ══════════════════════════════════════════════════════════════════
+#  PARALLEL ISOLATED TESTING
+#
+#  Идея изоляции: каждый слот (поток) получает СВОЙ диапазон
+#  локальных TCP-портов. Его winws запускается с --wf-raw, который
+#  перехватывает ТОЛЬКО пакеты с этими локальными портами, а проба
+#  биндится на исходящий порт из этого диапазона. Поэтому трафик
+#  слота A никогда не попадает в фильтр слота B (и наоборот).
+# ══════════════════════════════════════════════════════════════════
+
+PARALLEL_SLOTS = 3
+_ISO_PORT_BASE = 42000   # ниже динамического диапазона Windows (49152+)
+_ISO_PORT_SPAN = 1000
+
+
+class _PortPool:
+    """Циклический выдатчик локальных портов (чтобы не бить в TIME_WAIT)."""
+
+    def __init__(self, lo: int, hi: int):
+        self.lo, self.hi = lo, hi
+        self._next = lo
+        self._lock = threading.Lock()
+
+    @property
+    def range(self) -> tuple[int, int]:
+        return self.lo, self.hi
+
+    def next_port(self) -> int:
+        with self._lock:
+            p = self._next
+            self._next = self.lo if p >= self.hi else p + 1
+            return p
+
+
+def _make_slot_pools(n: int = PARALLEL_SLOTS) -> list:
+    return [
+        _PortPool(_ISO_PORT_BASE + i * _ISO_PORT_SPAN,
+                  _ISO_PORT_BASE + (i + 1) * _ISO_PORT_SPAN - 1)
+        for i in range(n)
+    ]
+
+
+def _open_connection(host: str, port: int, timeout: float, port_pool=None):
+    """TCP-коннект; если задан port_pool — с локального порта из его диапазона."""
+    if port_pool is None:
+        return socket.create_connection((host, port), timeout=timeout)
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    last_exc: Exception = OSError(f"cannot connect to {host}:{port}")
+    for family, stype, proto, _, addr in infos:
+        for _ in range(50):
+            s = socket.socket(family, stype, proto)
+            try:
+                s.bind(("", port_pool.next_port()))
+            except OSError as e:      # порт занят — берём следующий
+                s.close()
+                last_exc = e
+                continue
+            try:
+                s.settimeout(timeout)
+                s.connect(addr)
+                return s
+            except OSError as e:      # реальная сетевая ошибка — следующий адрес
+                s.close()
+                last_exc = e
+                break
+    raise last_exc
+
+
+def _find_winws_exe(zapret_dir: Path):
+    for p in (zapret_dir / "bin" / "winws.exe", zapret_dir / "winws.exe"):
+        if p.exists():
+            return p
+    return None
+
+
+def _winws_supports_wf_raw(exe: Path) -> bool:
+    try:
+        r = subprocess.run(
+            [str(exe), "--help"], capture_output=True, timeout=8,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        return "--wf-raw" in (r.stdout + r.stderr).decode("utf-8", "ignore")
+    except Exception:
+        return False
+
+
+def _tokenize_cmdline(s: str) -> list:
+    """Разбор командной строки с кавычками (кавычки удаляются)."""
+    tokens, cur, in_q, has = [], [], False, False
+    for ch in s:
+        if ch == '"':
+            in_q = not in_q
+            has = True
+            continue
+        if ch.isspace() and not in_q:
+            if has:
+                tokens.append("".join(cur))
+                cur, has = [], False
+            continue
+        cur.append(ch)
+        has = True
+    if has:
+        tokens.append("".join(cur))
+    return tokens
+
+
+def _parse_bat_winws_args(bat_path: Path):
+    """
+    Достаёт аргументы winws из .bat (с раскрытием %BIN%, %LISTS%, %~dp0, set-переменных)
+    и вырезает все --wf-* (фильтр WinDivert подставим свой).
+    Возвращает list[str] или None, если bat нетипичный (тогда тест пойдёт старым способом).
+    """
+    try:
+        text = bat_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+
+    text = re.sub(r"\^[ \t]*\r?\n", " ", text)          # склейка строк с ^
+    bat_dir = str(bat_path.parent.resolve()) + "\\"
+    env: dict = {}
+    cmd_lines: list = []
+
+    for line in text.splitlines():
+        s = line.strip()
+        low = s.lower()
+        if not s or low.startswith(("rem ", "::", "echo", "taskkill", "tasklist")):
+            continue
+        m = re.match(r'(?i)^set\s+"?([^=\s"]+)=(.*?)"?\s*$', s)
+        if m:
+            env[m.group(1).lower()] = m.group(2)
+            continue
+        if "winws.exe" in low:
+            rest = s[low.index("winws.exe") + len("winws.exe"):]
+            if " --" in rest:
+                cmd_lines.append(rest.lstrip('"'))
+
+    if len(cmd_lines) != 1:        # 0 или несколько winws в одном bat — не поддерживаем
+        return None
+
+    def expand(t: str):
+        for _ in range(6):
+            t = t.replace("%~dp0", bat_dir).replace("%~n0", bat_path.stem)
+
+            def rep(m):
+                name = m.group(1).lower()
+                if name in env:
+                    return env[name]
+                if name == "bin":
+                    return bat_dir + "bin\\"
+                if name == "lists":
+                    return bat_dir + "lists\\"
+                if name.startswith("gamefilter"):
+                    return "12"
+                raise KeyError(name)
+
+            try:
+                new = re.sub(r"%([A-Za-z0-9_]+)%", rep, t)
+            except KeyError:
+                return None
+            if new == t:
+                break
+            t = new
+        return None if re.search(r"%[A-Za-z~]", t) else t
+
+    expanded = expand(cmd_lines[0])
+    if expanded is None:
+        return None
+    args = [a for a in _tokenize_cmdline(expanded) if not a.lower().startswith("--wf-")]
+    return args or None
+
+
+def _iso_filter(lo: int, hi: int) -> str:
+    """WinDivert-фильтр: только TCP/443 с локальными портами слота."""
+    out = f"(outbound and tcp.DstPort==443 and tcp.SrcPort>={lo} and tcp.SrcPort<={hi})"
+    inn = f"(inbound and tcp.SrcPort==443 and tcp.DstPort>={lo} and tcp.DstPort<={hi})"
+    return f"!impostor and !loopback and ({out} or {inn})"
+
+
+class _IsolatedWinws:
+    """Один процесс winws со своим фильтром; убивается только он сам."""
+
+    def __init__(self, exe: Path, cwd: Path, args: list, port_range: tuple):
+        self.cmd = [str(exe), f"--wf-raw={_iso_filter(*port_range)}"] + args
+        self.cwd = str(cwd)
+        self.proc = None
+
+    def start(self, settle: float = 1.0) -> bool:
+        self.proc = subprocess.Popen(
+            self.cmd, cwd=self.cwd,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        time.sleep(settle)           # дать WinDivert открыться; невалидные опции => процесс уже завершился
+        return self.proc.poll() is None
+
+    def stop(self):
+        p = self.proc
+        if not p:
+            return
+        try:
+            if p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.wait(timeout=2)
+        except Exception:
+            pass
+
+
+def _test_bat_isolated(bat_path: Path, exe: Path, pool: _PortPool, services: list,
+                       stop_check, timeout: float, retries: int, stop_on_fail: bool = False):
+    """
+    Тест одного конфига в изолированном слоте.
+    Возвращает (state, results): state ∈ ok | unparsable | start_failed | stopped,
+    results = [(svc, ok, latency_ms, ip), ...]
+    """
+    args = _parse_bat_winws_args(bat_path)
+    if args is None:
+        return "unparsable", []
+    bin_dir = exe.parent
+    inst = _IsolatedWinws(exe, bin_dir, args, pool.range)
+    try:
+        if stop_check():
+            return "stopped", []
+        if not inst.start():
+            return "start_failed", []
+        results = []
+        for svc, url in services:
+            if stop_check():
+                return "stopped", results
+            ok, lat, ip = _probe(url, timeout=timeout, retries=retries, port_pool=pool)
+            results.append((svc, ok, lat, ip))
+            if stop_on_fail and not ok:
+                break
+        return "ok", results
+    finally:
+        inst.stop()
+
+
+def _test_bat_legacy(bat_path: Path, services: list, stop_check, timeout: float,
+                     retries: int, stop_on_fail: bool = False):
+    """Старый способ (через сам bat, убивает ВСЕ winws) — только для последовательного режима."""
+    _kill_winws()
+    time.sleep(0.5)
+    try:
+        if stop_check():
+            return "stopped", []
+        _run_bat_admin(bat_path)
+        for _ in range(40):
+            if _is_winws_running():
+                break
+            time.sleep(0.15)
+        time.sleep(0.5)
+        if not _is_winws_running():
+            return "start_failed", []
+        results = []
+        for svc, url in services:
+            if stop_check():
+                return "stopped", results
+            ok, lat, ip = _probe(url, timeout=timeout, retries=retries)
+            results.append((svc, ok, lat, ip))
+            if stop_on_fail and not ok:
+                break
+        return "ok", results
+    finally:
+        _kill_winws()
 
 
 def _make_tray_icon(connected: bool) -> QIcon:
@@ -357,6 +648,25 @@ QPushButton#testBtn[testing="true"] {
     border-color: #333;
 }
 
+QPushButton#startBtn {
+    background: #1a1a1a;
+    color: #ffffff;
+    border: 1px solid #2a2a2a;
+    border-radius: 6px;
+    padding: 8px 18px;
+    font-size: 12px;
+    font-weight: 600;
+}
+QPushButton#startBtn:hover {
+    background: #252525;
+    border-color: #444;
+    color: #ffffff;
+}
+QPushButton#startBtn:pressed {
+    background: #141414;
+    color: #ffffff;
+}
+
 QPushButton#stopBtn {
     background: #1a1a1a;
     color: #bbb;
@@ -445,6 +755,63 @@ QTextEdit#console {
     font-size: 11px;
     padding: 8px;
 }
+
+/* ── Inputs & Utils Form ── */
+QLineEdit {
+    background: #111111;
+    color: #cccccc;
+    border: 1px solid #222222;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 12px;
+}
+QLineEdit:focus {
+    border: 1px solid #444444;
+    background: #141414;
+    color: #ffffff;
+}
+QLineEdit:disabled {
+    color: #444444;
+    background: #0d0d0d;
+    border-color: #1a1a1a;
+}
+
+QTextEdit#settingText {
+    background: #111111;
+    color: #cccccc;
+    border: 1px solid #222222;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-family: 'Cascadia Code', 'Consolas', monospace;
+    font-size: 11px;
+}
+QTextEdit#settingText:focus {
+    border: 1px solid #444444;
+    color: #ffffff;
+}
+
+QScrollArea {
+    border: none;
+    background: transparent;
+}
+QScrollArea > QWidget > QWidget {
+    background: transparent;
+}
+
+QPushButton#iconBtn {
+    background: #1a1a1a;
+    color: #bbb;
+    border: 1px solid #2a2a2a;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 600;
+}
+QPushButton#iconBtn:hover {
+    background: #252525;
+    border-color: #444;
+    color: #fff;
+}
+
 
 /* ── ScrollBar ── */
 QScrollBar:vertical {
@@ -724,11 +1091,12 @@ class TestWorker(QThread):
     ranked = pyqtSignal(str)
     finished = pyqtSignal()
 
-    def __init__(self, bat_files: list, zapret_dir: Path, was_connected: bool = False):
+    def __init__(self, bat_files: list, zapret_dir: Path, was_connected: bool = False, multi_ping: bool = False):
         super().__init__()
         self.bat_files = list(bat_files)
         self.zapret_dir = zapret_dir
         self.was_connected = was_connected
+        self.multi_ping = multi_ping
         self._stop = False
 
     def stop(self):
@@ -745,63 +1113,158 @@ class TestWorker(QThread):
             ("YouTube", "https://www.youtube.com/generate_204"),
         ]
 
-        scored_configs = []
+        _kill_winws()
+        time.sleep(0.5)
 
-        for idx, bat_file in enumerate(self.bat_files):
-            if self._stop:
-                break
+        exe = _find_winws_exe(self.zapret_dir)
+        parallel = self.multi_ping and exe is not None and _winws_supports_wf_raw(exe)
+        if parallel:
+            self.log.emit(f"  Parallel mode: {PARALLEL_SLOTS} isolated slots", "dim")
+        elif self.multi_ping:
+            self.log.emit("  winws has no --wf-raw support → sequential mode", "dim")
+        else:
+            self.log.emit("  Sequential mode", "dim")
 
-            bat_path = self.zapret_dir / bat_file
-            self.log.emit(f"\n▶ [{idx+1}/{total}] {bat_file}", "white")
+        stop_check = lambda: self._stop
+        scored: dict = {}            # bat -> (ok_count, avg_lat)
+        fallback: list = []          # bat, которые не удалось разобрать
+        lock = threading.Lock()
+        done = [0]
 
-            _kill_winws()
-            time.sleep(0.5)
+        def _report(bat_file, state, results):
+            """Один непрерывный блок лога + запись результата. Вызывать под lock."""
+            done[0] += 1
+            self.log.emit(f"\n▶ [{done[0]}/{total}] {bat_file}", "white")
+            if state == "start_failed":
+                self.log.emit("    winws failed to start, skipping...", "dim")
+                scored[bat_file] = (0, 99999)
+                return
+            if state != "ok":
+                scored[bat_file] = (0, 99999)
+                return
+            ok_count, latencies = 0, []
+            for svc, ok, lat, ip in results:
+                if ok:
+                    ok_count += 1
+                    if lat:
+                        latencies.append(lat)
+                extra = f" ({lat} ms)" if ok and lat else ""
+                self.log.emit(f"    {svc}: {'✓' if ok else '✗'}{extra}", "white" if ok else "dim")
+            avg = int(sum(latencies) / len(latencies)) if latencies else 9999
+            scored[bat_file] = (ok_count, avg)
 
-            if self._stop:
-                break
+        if not parallel:
+            for idx, bat_file in enumerate(self.bat_files):
+                if self._stop:
+                    break
 
-            try:
-                _run_bat_admin(bat_path)
-                for _ in range(20):
-                    if _is_winws_running():
-                        break
-                    time.sleep(0.15)
+                bat_path = self.zapret_dir / bat_file
+                self.log.emit(f"\n▶ [{idx + 1}/{total}] {bat_file}", "white")
+
+                _kill_winws()
                 time.sleep(0.5)
 
-                if not _is_winws_running():
-                    self.log.emit("    winws failed to start, skipping...", "dim")
-                    scored_configs.append((bat_file, 0, 99999))
+                if self._stop:
+                    break
+
+                try:
+                    _run_bat_admin(bat_path)
+                    for _ in range(20):
+                        if _is_winws_running():
+                            break
+                        time.sleep(0.15)
+                    time.sleep(0.5)
+
+                    if not _is_winws_running():
+                        self.log.emit("    winws failed to start, skipping...", "dim")
+                        scored[bat_file] = (0, 99999)
+                        continue
+
+                    # Probe services
+                    ok_count = 0
+                    latencies = []
+
+                    for svc, url in services:
+                        if self._stop:
+                            break
+                        ok, lat, ip = _probe(url, timeout=3.5, retries=1)
+                        if ok:
+                            ok_count += 1
+                            if lat:
+                                latencies.append(lat)
+                        mark = "✓" if ok else "✗"
+                        extra = f" ({lat} ms)" if ok and lat else ""
+                        self.log.emit(f"    {svc}: {mark}{extra}", "white" if ok else "dim")
+
+                    avg_lat = int(sum(latencies) / len(latencies)) if latencies else 9999
+                    scored[bat_file] = (ok_count, avg_lat)
+
+                except Exception as e:
+                    self.log.emit(f"    Error: {e}", "white")
+                    scored[bat_file] = (0, 99999)
+                finally:
+                    _kill_winws()
+        else:
+            work: "queue.Queue" = queue.Queue()
+            for b in self.bat_files:
+                work.put(b)
+
+            def slot_worker(pool):
+                while not self._stop:
+                    try:
+                        bat_file = work.get_nowait()
+                    except queue.Empty:
+                        return
+                    try:
+                        state, res = _test_bat_isolated(
+                            self.zapret_dir / bat_file, exe, pool, services,
+                            stop_check, timeout=3.5, retries=1,
+                        )
+                    except Exception as e:
+                        with lock:
+                            self.log.emit(f"    Error ({bat_file}): {e}", "white")
+                            scored[bat_file] = (0, 99999)
+                        continue
+                    if state == "stopped":
+                        return
+                    with lock:
+                        if state == "unparsable":
+                            fallback.append(bat_file)
+                        else:
+                            _report(bat_file, state, res)
+
+            threads = [threading.Thread(target=slot_worker, args=(p,), daemon=True)
+                       for p in _make_slot_pools()]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            # Unparsable fallback in parallel mode
+            for bat_file in fallback:
+                if self._stop:
+                    break
+                try:
+                    state, res = _test_bat_legacy(
+                        self.zapret_dir / bat_file, services, stop_check, timeout=3.5, retries=1,
+                    )
+                except Exception as e:
+                    self.log.emit(f"    Error ({bat_file}): {e}", "white")
+                    scored[bat_file] = (0, 99999)
                     continue
+                if state != "stopped":
+                    with lock:
+                        _report(bat_file, state, res)
 
-                # Probe services
-                ok_count = 0
-                latencies = []
-
-                for svc, url in services:
-                    if self._stop:
-                        break
-                    ok, lat, ip = _probe(url, timeout=3.5, retries=1)
-                    if ok:
-                        ok_count += 1
-                        if lat:
-                            latencies.append(lat)
-                    mark = "✓" if ok else "✗"
-                    extra = f" ({lat} ms)" if ok and lat else ""
-                    self.log.emit(f"    {svc}: {mark}{extra}", "white" if ok else "dim")
-
-                avg_lat = int(sum(latencies) / len(latencies)) if latencies else 9999
-                scored_configs.append((bat_file, ok_count, avg_lat))
-
-            except Exception as e:
-                self.log.emit(f"    Error: {e}", "white")
-                scored_configs.append((bat_file, 0, 99999))
-            finally:
-                _kill_winws()
+        _kill_winws()
 
         if self._stop:
             self.log.emit("\n⛔  Testing all configs stopped.", "white")
             self.finished.emit()
             return
+
+        # Сохраняем исходный порядок bat_files перед сортировкой (как в оригинале)
+        scored_configs = [(b, *scored[b]) for b in self.bat_files if b in scored]
 
         # Sort: highest ok_count first, then lowest avg_lat
         scored_configs.sort(key=lambda x: (x[1], -x[2]), reverse=True)
@@ -1094,7 +1557,7 @@ STRATEGIES = [
 ]
 
 
-def _generate_bat_content(zapret_dir: Path, strategy_args: str) -> str:
+def _generate_bat_content(zapret_dir: Path, strategy_args: str, name: str = "") -> str:
     """Generate a complete bat file content using a strategy."""
     bin_dir = zapret_dir / "bin"
     lists_dir = zapret_dir / "lists"
@@ -1104,8 +1567,9 @@ def _generate_bat_content(zapret_dir: Path, strategy_args: str) -> str:
     # Replace {bin} placeholder
     tcp_args = strategy_args.replace("{bin}", "%BIN%")
 
+    rem_line = f"rem zapret++ strategy: {name}\n" if name else ""
     content = f'''@echo off
-chcp 65001 > nul
+{rem_line}chcp 65001 > nul
 cd /d "%~dp0"
 
 set "BIN=%~dp0bin\\"
@@ -1121,17 +1585,73 @@ start "zapret: %~n0" /min "%BIN%winws.exe" --wf-tcp=80,443 --wf-udp=443,19294-19
     return content
 
 
+def _extract_strategy_counter(arg_str: str) -> Counter:
+    tokens = []
+    clean_str = re.sub(r'\^\s*[\r\n]+', ' ', arg_str)
+    for tok in clean_str.split():
+        tok = tok.strip().strip('"').strip("'")
+        if not tok or not tok.lower().startswith("--dpi-desync"):
+            continue
+        tok = tok.replace("{bin}", "").replace("%BIN%", "").replace("%bin%", "")
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            v = v.strip('"').strip("'").replace("\\", "/").split("/")[-1].lower()
+            tokens.append(f"{k.lower()}={v}")
+        else:
+            tokens.append(tok.lower())
+    return Counter(tokens)
+
+
+def _is_strategy_existing(zapret_dir: Path, strategy_args: str, strategy_name: str = "") -> bool:
+    if not zapret_dir.exists():
+        return False
+
+    candidate_counter = _extract_strategy_counter(strategy_args)
+    if not candidate_counter:
+        return False
+
+    for bat_path in sorted(zapret_dir.glob("*.bat")):
+        if bat_path.name.startswith("_test_"):
+            continue
+        if bat_path.name.lower() in ("service.bat", "service_install.bat", "service_remove.bat"):
+            continue
+
+        try:
+            content = bat_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+
+        # 1. Match by strategy name recorded in custom header
+        if strategy_name:
+            m = re.search(r'rem\s+zapret\+\+\s+strategy:\s*(\S+)', content, re.IGNORECASE)
+            if m and m.group(1).lower() == strategy_name.lower():
+                return True
+
+        # 2. Match by exact desync parameters counter
+        clean_bat = re.sub(r'\^\s*[\r\n]+', ' ', content)
+        for block in clean_bat.split("--new"):
+            if candidate_counter == _extract_strategy_counter(block):
+                return True
+
+    return False
+
+
+def _find_existing_strategy(zapret_dir: Path, strategy_args: str, strategy_name: str = ""):
+    return (_is_strategy_existing(zapret_dir, strategy_args, strategy_name), 0)
+
+
 class CreateWorker(QThread):
     log = pyqtSignal(str, str)
     success = pyqtSignal(str)  # filename of created bat
     finished = pyqtSignal()
 
-    def __init__(self, zapret_dir: Path, target_discord: bool = True, target_youtube: bool = True, num_configs: int = 1):
+    def __init__(self, zapret_dir: Path, target_discord: bool = True, target_youtube: bool = True, num_configs: int = 1, multi_ping: bool = False):
         super().__init__()
         self.zapret_dir = zapret_dir
         self.target_discord = target_discord
         self.target_youtube = target_youtube
         self.num_configs = num_configs
+        self.multi_ping = multi_ping
         self._stop = False
 
     def stop(self):
@@ -1142,131 +1662,268 @@ class CreateWorker(QThread):
         self.log.emit(f"  Route creation started ({self.num_configs} config(s) requested)", "white")
         self.log.emit("━" * 45, "dim")
         targets = []
+        services = []
         if self.target_discord:
             targets.append("Discord")
+            services.append(("Discord", "https://discord.com/api/v9/gateway"))
         if self.target_youtube:
             targets.append("YouTube")
+            services.append(("YouTube", "https://www.youtube.com/generate_204"))
         self.log.emit(f"  Target(s): {', '.join(targets)}", "dim")
 
         # Shuffle strategies for randomness
         strats = list(STRATEGIES)
         random.shuffle(strats)
+        total = len(strats)
 
-        created_count = 0
+        _kill_winws()
+        time.sleep(0.5)
 
-        for idx, (name, args) in enumerate(strats):
-            if self._stop:
-                break
+        exe = _find_winws_exe(self.zapret_dir)
+        parallel = self.multi_ping and exe is not None and _winws_supports_wf_raw(exe)
+        if parallel:
+            self.log.emit(f"  Parallel mode: {PARALLEL_SLOTS} isolated slots", "dim")
+        elif self.multi_ping:
+            self.log.emit("  winws has no --wf-raw support → sequential mode", "dim")
+        else:
+            self.log.emit("  Sequential mode", "dim")
 
-            self.log.emit(f"\n▶ Attempt {idx + 1}/{len(strats)}: {name}", "white")
-
-            # Kill any running winws
-            _kill_winws()
-            time.sleep(0.5)
-
-            # Generate bat file
-            bat_content = _generate_bat_content(self.zapret_dir, args)
-            tmp_bat = self.zapret_dir / f"_test_custom_{name}.bat"
-
+        def _rm(p: Path):
             try:
-                tmp_bat.write_text(bat_content, encoding="utf-8")
-            except Exception as e:
-                self.log.emit(f"  Error writing bat: {e}", "white")
-                continue
+                p.unlink()
+            except Exception:
+                pass
 
-            # Run it
-            self.log.emit("  Starting winws...", "dim")
-            try:
-                _run_bat_admin(tmp_bat)
-            except Exception as e:
-                self.log.emit(f"  Error running bat: {e}", "white")
-                try:
-                    tmp_bat.unlink()
-                except Exception:
-                    pass
-                continue
-
-            # Wait for winws to start
-            for _ in range(15):
-                if _is_winws_running():
+        if not parallel:
+            created_count = 0
+            for idx, (name, args) in enumerate(strats):
+                if self._stop:
                     break
-                time.sleep(0.4)
 
-            if self._stop:
+                self.log.emit(f"\n▶ Attempt {idx + 1}/{total}: {name}", "white")
+
                 _kill_winws()
+                time.sleep(0.5)
+
+                bat_content = _generate_bat_content(self.zapret_dir, args, name)
+                tmp_bat = self.zapret_dir / f"_test_custom_{name}.bat"
+
                 try:
-                    tmp_bat.unlink()
-                except Exception:
-                    pass
-                break
+                    tmp_bat.write_text(bat_content, encoding="utf-8")
+                except Exception as e:
+                    self.log.emit(f"  Error writing bat: {e}", "white")
+                    continue
 
-            if not _is_winws_running():
-                self.log.emit("  winws did not start", "dim")
+                self.log.emit("  Starting winws...", "dim")
                 try:
-                    tmp_bat.unlink()
-                except Exception:
-                    pass
-                continue
+                    _run_bat_admin(tmp_bat)
+                except Exception as e:
+                    self.log.emit(f"  Error running bat: {e}", "white")
+                    _rm(tmp_bat)
+                    continue
 
-            # Test connectivity — only user-selected targets
-            discord_ok = True
-            youtube_ok = True
+                for _ in range(20):
+                    if _is_winws_running():
+                        break
+                    time.sleep(0.2)
 
-            if self.target_discord:
-                self.log.emit("  Testing Discord...", "dim")
-                discord_ok, _, discord_ip = _probe("https://discord.com/api/v9/gateway", timeout=4.0, retries=2)
-                self.log.emit(f"    Discord: {'✓' if discord_ok else '✗'} (ip={discord_ip or '?'})",
-                              "white" if discord_ok else "dim")
+                if self._stop:
+                    _kill_winws()
+                    _rm(tmp_bat)
+                    break
 
-            if self._stop:
+                if not _is_winws_running():
+                    self.log.emit("  winws did not start", "dim")
+                    _rm(tmp_bat)
+                    continue
+
+                discord_ok = True
+                youtube_ok = True
+
+                if self.target_discord:
+                    self.log.emit("  Testing Discord...", "dim")
+                    discord_ok, _, discord_ip = _probe("https://discord.com/api/v9/gateway", timeout=4.0, retries=2)
+                    self.log.emit(f"    Discord: {'✓' if discord_ok else '✗'} (ip={discord_ip or '?'})",
+                                  "white" if discord_ok else "dim")
+
+                if self._stop:
+                    _kill_winws()
+                    _rm(tmp_bat)
+                    break
+
+                if self.target_youtube and discord_ok:
+                    self.log.emit("  Testing YouTube...", "dim")
+                    youtube_ok, _, youtube_ip = _probe("https://www.youtube.com/generate_204", timeout=4.0, retries=2)
+                    self.log.emit(f"    YouTube: {'✓' if youtube_ok else '✗'} (ip={youtube_ip or '?'})",
+                                  "white" if youtube_ok else "dim")
+
                 _kill_winws()
-                try:
-                    tmp_bat.unlink()
-                except Exception:
-                    pass
-                break
+                time.sleep(0.5)
 
-            if self.target_youtube:
-                self.log.emit("  Testing YouTube...", "dim")
-                youtube_ok, _, youtube_ip = _probe("https://www.youtube.com/generate_204", timeout=4.0, retries=2)
-                self.log.emit(f"    YouTube: {'✓' if youtube_ok else '✗'} (ip={youtube_ip or '?'})",
-                              "white" if youtube_ok else "dim")
+                if discord_ok and youtube_ok:
+                    if _is_strategy_existing(self.zapret_dir, args, name):
+                        self.log.emit("  That config already exists.", "#9370DB")
+                        _rm(tmp_bat)
+                        continue
 
-            _kill_winws()
-            time.sleep(0.5)
+                    created_count += 1
+                    custom_num = 1
+                    while (self.zapret_dir / f"custom_{custom_num}.bat").exists():
+                        custom_num += 1
+                    final_name = f"custom_{custom_num}.bat"
+                    final_path = self.zapret_dir / final_name
 
-            if discord_ok and youtube_ok:
-                created_count += 1
-                custom_num = 1
-                while (self.zapret_dir / f"custom_{custom_num}.bat").exists():
-                    custom_num += 1
-                final_name = f"custom_{custom_num}.bat"
-                final_path = self.zapret_dir / final_name
-
-                try:
-                    tmp_bat.rename(final_path)
-                except Exception:
                     try:
-                        final_path.write_text(bat_content, encoding="utf-8")
-                        tmp_bat.unlink()
+                        tmp_bat.rename(final_path)
                     except Exception:
-                        pass
+                        try:
+                            final_path.write_text(bat_content, encoding="utf-8")
+                            tmp_bat.unlink()
+                        except Exception:
+                            pass
 
-                self.log.emit(f"\n✅  Working config #{created_count}/{self.num_configs} found: {final_name}", "white")
-                self.log.emit(f"  Strategy: {name}", "dim")
-                self.success.emit(final_name)
+                    self.log.emit(f"\n✅  Working config #{created_count}/{self.num_configs} found: {final_name}", "white")
+                    self.log.emit(f"  Strategy: {name}", "dim")
+                    self.success.emit(final_name)
 
-                if created_count >= self.num_configs:
-                    break
+                    if created_count >= self.num_configs:
+                        break
+                else:
+                    _rm(tmp_bat)
+                    self.log.emit("  ✗ No access, trying next...", "dim")
+
+            _kill_winws()
+            for leftover in self.zapret_dir.glob("_test_custom_*.bat"):
+                _rm(leftover)
+
+            if self._stop:
+                self.log.emit("\n⛔  Route creation stopped.", "white")
+            elif created_count == 0:
+                self.log.emit("\n✗  All strategies exhausted. No working route found.", "white")
             else:
+                self.log.emit(f"\n✅  Finished. Created {created_count}/{self.num_configs} route(s).", "white")
+
+            self.finished.emit()
+            return
+
+        work: "queue.Queue" = queue.Queue()
+        for idx, item in enumerate(strats):
+            work.put((idx, item))
+
+        lock = threading.Lock()
+        enough = threading.Event()
+        created = [0]
+        created_names = set()
+        stop_check = lambda: self._stop or enough.is_set()
+
+        def slot_worker(pool):
+            while not stop_check():
                 try:
-                    tmp_bat.unlink()
-                except Exception:
-                    pass
-                self.log.emit("  ✗ No access, trying next...", "dim")
+                    idx, (name, args) = work.get_nowait()
+                except queue.Empty:
+                    return
+
+                bat_content = _generate_bat_content(self.zapret_dir, args, name)
+                tmp_bat = self.zapret_dir / f"_test_custom_{name}.bat"
+                try:
+                    tmp_bat.write_text(bat_content, encoding="utf-8")
+                except Exception as e:
+                    with lock:
+                        self.log.emit(f"\n▶ Attempt {idx + 1}/{total}: {name}", "white")
+                        self.log.emit(f"  Error writing bat: {e}", "white")
+                    continue
+
+                try:
+                    state, res = _test_bat_isolated(
+                        tmp_bat, exe, pool, services, stop_check,
+                        timeout=4.0, retries=2, stop_on_fail=True,
+                    )
+                except Exception as e:
+                    _rm(tmp_bat)
+                    with lock:
+                        self.log.emit(f"\n▶ Attempt {idx + 1}/{total}: {name}", "white")
+                        self.log.emit(f"  Error: {e}", "white")
+                    continue
+
+                if state == "stopped":
+                    _rm(tmp_bat)
+                    return
+
+                with lock:
+                    if stop_check():
+                        _rm(tmp_bat)
+                        return
+
+                    self.log.emit(f"\n▶ Attempt {idx + 1}/{total}: {name}", "white")
+                    if state == "unparsable":
+                        self.log.emit("  Cannot parse generated bat, skipping", "dim")
+                        _rm(tmp_bat)
+                        continue
+                    if state == "start_failed":
+                        self.log.emit("  winws did not start", "dim")
+                        _rm(tmp_bat)
+                        continue
+
+                    for svc, ok, _lat, ip in res:
+                        self.log.emit(f"    {svc}: {'✓' if ok else '✗'} (ip={ip or '?'})",
+                                      "white" if ok else "dim")
+
+                    all_ok = len(res) == len(services) and all(r[1] for r in res)
+                    if not all_ok:
+                        _rm(tmp_bat)
+                        self.log.emit("  ✗ No access, trying next...", "dim")
+                        continue
+
+                    if enough.is_set() or created[0] >= self.num_configs:
+                        self.log.emit("  Working, but the requested number of configs is already found — skipped.", "dim")
+                        _rm(tmp_bat)
+                        return
+
+                    if _is_strategy_existing(self.zapret_dir, args, name) or name in created_names:
+                        self.log.emit("  That config already exists.", "#9370DB")
+                        _rm(tmp_bat)
+                        continue
+
+                    created[0] += 1
+                    created_names.add(name)
+                    custom_num = 1
+                    while (self.zapret_dir / f"custom_{custom_num}.bat").exists():
+                        custom_num += 1
+                    final_name = f"custom_{custom_num}.bat"
+                    final_path = self.zapret_dir / final_name
+
+                    try:
+                        tmp_bat.rename(final_path)
+                    except Exception:
+                        try:
+                            final_path.write_text(bat_content, encoding="utf-8")
+                            tmp_bat.unlink()
+                        except Exception:
+                            pass
+
+                    self.log.emit(f"\n✅  Working config #{created[0]}/{self.num_configs} found: {final_name}", "white")
+                    self.log.emit(f"  Strategy: {name}", "dim")
+                    self.success.emit(final_name)
+
+                    if created[0] >= self.num_configs:
+                        enough.set()
+                        return
+
+        n_threads = PARALLEL_SLOTS
+        pools = _make_slot_pools(n_threads)
+        threads = [threading.Thread(target=slot_worker, args=(p,), daemon=True) for p in pools]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
         _kill_winws()
 
+        # Подчистка возможных хвостов _test_custom_*.bat
+        for leftover in self.zapret_dir.glob("_test_custom_*.bat"):
+            _rm(leftover)
+
+        created_count = created[0]
         if self._stop:
             self.log.emit("\n⛔  Route creation stopped.", "white")
         elif created_count == 0:
@@ -1308,12 +1965,23 @@ class MainWindow(QMainWindow):
 
         # Paths
         self._app_dir = get_app_dir()
+        self._settings_dir = get_settings_dir(self._app_dir)
         self._zapret_dir = self._find_zapret_dir()
-        self._cfg_file = self._app_dir / "zapret_settings.json"
+        self._cfg_file = self._settings_dir / "zapret_settings.json"
 
         self._auto_connect = False
         self._auto_start = False
+        self._tg_auto_connect = False
+        self._multi_ping = False
+
+        self._tg_manager = TgProxyManager.get(self._app_dir)
+        self._tg_config = self._tg_manager.config
+        self._cfproxy_test_worker: CfProxyTestWorker | None = None
+        self._cfworker_test_worker: CfWorkerTestWorker | None = None
+
         self._load_settings()
+        if "auto_connect" in self._tg_config:
+            self._tg_auto_connect = bool(self._tg_config.get("auto_connect", False))
 
         self._build_ui()
         self._load_bat_files()
@@ -1327,6 +1995,9 @@ class MainWindow(QMainWindow):
 
         if self._auto_connect and self._current_bat:
             QTimer.singleShot(1000, self._connect)
+
+        if self._tg_auto_connect and not self._tg_manager.is_running():
+            QTimer.singleShot(500, self._tg_start_proxy_silent)
 
     # ── Zapret dir detection (reworked) ───────────────────────────
 
@@ -1342,7 +2013,7 @@ class MainWindow(QMainWindow):
                 continue
             # Skip known non-zapret dirs
             if item.name.lower() in ("icons", "__pycache__", "build", "dist",
-                                      ".git", "venv", ".venv"):
+                                      ".git", "venv", ".venv", "settings"):
                 continue
 
             has_bats = bool(list(item.glob("*.bat")))
@@ -1370,23 +2041,41 @@ class MainWindow(QMainWindow):
     # ── Settings ──────────────────────────────────────────────────
 
     def _load_settings(self):
+        legacy_file = self._app_dir / "zapret_settings.json"
+        target_file = None
         if self._cfg_file.exists():
+            target_file = self._cfg_file
+        elif legacy_file.exists():
+            target_file = legacy_file
+
+        if target_file and target_file.exists():
             try:
-                d = json.loads(self._cfg_file.read_text(encoding="utf-8"))
+                d = json.loads(target_file.read_text(encoding="utf-8"))
                 self._current_bat = d.get("last_bat")
                 self._auto_connect = d.get("auto_connect", False)
                 self._auto_start = d.get("auto_start", False)
+                self._tg_auto_connect = d.get("tg_auto_connect", False)
+                self._multi_ping = d.get("multi_ping", False)
                 self._apply_auto_start()
+                if target_file == legacy_file:
+                    self._save_settings()
+                    try:
+                        legacy_file.unlink()
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
     def _save_settings(self):
         try:
+            self._settings_dir.mkdir(parents=True, exist_ok=True)
             self._cfg_file.write_text(
                 json.dumps({
                     "last_bat": self._current_bat,
                     "auto_connect": self._auto_connect,
                     "auto_start": self._auto_start,
+                    "tg_auto_connect": self._tg_auto_connect,
+                    "multi_ping": self._multi_ping,
                 }, ensure_ascii=False, indent=2),
                 encoding="utf-8"
             )
@@ -1444,23 +2133,28 @@ class MainWindow(QMainWindow):
         self._tab_connect = self._mk_tab("Connect")
         self._tab_create = self._mk_tab("Create")
         self._tab_settings = self._mk_tab("Settings")
+        self._tab_utils = self._mk_tab("Utils")
 
         self._tab_connect.clicked.connect(lambda: self._switch(0))
         self._tab_create.clicked.connect(lambda: self._switch(1))
         self._tab_settings.clicked.connect(lambda: self._switch(2))
+        self._tab_utils.clicked.connect(lambda: self._switch(3))
 
         tb.addWidget(self._tab_connect)
         tb.addWidget(self._tab_create)
         tb.addWidget(self._tab_settings)
+        tb.addWidget(self._tab_utils)
         vlay.addWidget(tab_bar)
 
         # Pages
         self._pg_connect = self._build_connect_page()
         self._pg_create = self._build_create_page()
         self._pg_settings = self._build_settings_page()
+        self._pg_utils = self._build_utils_page()
         vlay.addWidget(self._pg_connect, 1)
         vlay.addWidget(self._pg_create, 1)
         vlay.addWidget(self._pg_settings, 1)
+        vlay.addWidget(self._pg_utils, 1)
 
         # Status bar
         self._status_bar = QLabel()
@@ -1482,7 +2176,8 @@ class MainWindow(QMainWindow):
         self._pg_connect.setVisible(idx == 0)
         self._pg_create.setVisible(idx == 1)
         self._pg_settings.setVisible(idx == 2)
-        for i, b in enumerate([self._tab_connect, self._tab_create, self._tab_settings]):
+        self._pg_utils.setVisible(idx == 3)
+        for i, b in enumerate([self._tab_connect, self._tab_create, self._tab_settings, self._tab_utils]):
             b.setProperty("active", "true" if i == idx else "false")
             b.style().unpolish(b)
             b.style().polish(b)
@@ -1785,6 +2480,18 @@ class MainWindow(QMainWindow):
         self._btn_clear.clicked.connect(self._console_clear)
         left_lay.addWidget(self._btn_clear)
 
+        left_lay.addSpacing(6)
+
+        opt_lbl = QLabel("OPTIONS")
+        opt_lbl.setObjectName("sectionLbl")
+        left_lay.addWidget(opt_lbl)
+
+        self._chk_multi_ping = QCheckBox("Multi-ping")
+        self._chk_multi_ping.setChecked(self._multi_ping)
+        self._chk_multi_ping.setToolTip("Test 3 configs simultaneously in parallel slots")
+        self._chk_multi_ping.toggled.connect(self._on_multi_ping_toggled)
+        left_lay.addWidget(self._chk_multi_ping)
+
         left_lay.addSpacing(10)
 
         res_lbl = QLabel("RESULTS")
@@ -1821,6 +2528,638 @@ class MainWindow(QMainWindow):
         hlay.addWidget(right, 65)
         return w
 
+    # ══════════════════════════════════════════════════════════════
+    #  UTILS PAGE — TG WS Proxy integration (1 to 1)
+    # ══════════════════════════════════════════════════════════════
+
+    def _build_utils_page(self) -> QWidget:
+        w = QWidget()
+        hlay = QHBoxLayout(w)
+        hlay.setContentsMargins(0, 0, 0, 0)
+        hlay.setSpacing(0)
+
+        # ── Left panel: Status, Quick Actions, Console ──
+        left = QWidget()
+        left.setObjectName("panelLeft")
+        left_lay = QVBoxLayout(left)
+        left_lay.setContentsMargins(16, 14, 16, 14)
+        left_lay.setSpacing(8)
+
+        lbl = QLabel("TG WS PROXY")
+        lbl.setObjectName("sectionLbl")
+        left_lay.addWidget(lbl)
+        left_lay.addSpacing(2)
+
+        # Status card
+        status_box = QWidget()
+        status_box.setObjectName("tgStatusBox")
+        status_box.setStyleSheet(
+            "QWidget#tgStatusBox { background: #111111; border: 1px solid #1c1c1c; border-radius: 6px; }"
+        )
+        sbox_lay = QVBoxLayout(status_box)
+        sbox_lay.setContentsMargins(10, 10, 10, 10)
+        sbox_lay.setSpacing(6)
+
+        self._tg_status_lbl = QLabel("○ STOPPED")
+        self._tg_status_lbl.setStyleSheet(
+            "color: #777; font-size: 13px; font-weight: 700; background: transparent; border: none;"
+        )
+        sbox_lay.addWidget(self._tg_status_lbl)
+
+        self._tg_info_lbl = QLabel("127.0.0.1:1443")
+        self._tg_info_lbl.setStyleSheet(
+            "color: #555; font-size: 11px; background: transparent; border: none;"
+        )
+        sbox_lay.addWidget(self._tg_info_lbl)
+
+        # Start / Stop and Restart buttons
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        self._btn_tg_toggle = QPushButton("Start Proxy")
+        self._btn_tg_toggle.setObjectName("startBtn")
+        self._btn_tg_toggle.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_tg_toggle.clicked.connect(self._tg_toggle_proxy)
+
+        self._btn_tg_restart = QPushButton("Restart")
+        self._btn_tg_restart.setObjectName("actionBtn")
+        self._btn_tg_restart.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_tg_restart.clicked.connect(self._tg_restart_proxy)
+
+        btn_row.addWidget(self._btn_tg_toggle, 1)
+        btn_row.addWidget(self._btn_tg_restart)
+        sbox_lay.addLayout(btn_row)
+
+        left_lay.addWidget(status_box)
+        left_lay.addSpacing(6)
+
+        # Telegram integration actions
+        tg_act_lbl = QLabel("ACTIONS")
+        tg_act_lbl.setObjectName("sectionLbl")
+        left_lay.addWidget(tg_act_lbl)
+
+        self._btn_tg_open = QPushButton("Connect a Telegram proxy")
+        self._btn_tg_open.setObjectName("actionBtn")
+        self._btn_tg_open.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_tg_open.clicked.connect(self._tg_open_telegram)
+        left_lay.addWidget(self._btn_tg_open)
+
+        self._btn_tg_copy = QPushButton("Copy Proxy Link")
+        self._btn_tg_copy.setObjectName("actionBtn")
+        self._btn_tg_copy.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_tg_copy.clicked.connect(self._tg_copy_link)
+        left_lay.addWidget(self._btn_tg_copy)
+
+        self._btn_tg_logs = QPushButton("Open Log File")
+        self._btn_tg_logs.setObjectName("actionBtn")
+        self._btn_tg_logs.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_tg_logs.clicked.connect(self._tg_open_log_file)
+        left_lay.addWidget(self._btn_tg_logs)
+
+        left_lay.addSpacing(6)
+
+        # Options: Auto-connect
+        opt_lbl = QLabel("OPTIONS")
+        opt_lbl.setObjectName("sectionLbl")
+        left_lay.addWidget(opt_lbl)
+
+        self._chk_tg_autoconnect = QCheckBox("Auto-connect with start")
+        self._chk_tg_autoconnect.setChecked(self._tg_auto_connect)
+        self._chk_tg_autoconnect.setToolTip("Start TG WS Proxy automatically on application launch")
+        self._chk_tg_autoconnect.toggled.connect(self._tg_on_autoconnect_toggled)
+        left_lay.addWidget(self._chk_tg_autoconnect)
+
+        left_lay.addSpacing(6)
+
+        # Console header & Clear
+        con_row = QHBoxLayout()
+        con_lbl = QLabel("OUTPUT")
+        con_lbl.setObjectName("sectionLbl")
+        con_row.addWidget(con_lbl)
+        con_row.addStretch()
+        btn_tg_clear = QPushButton("Clear")
+        btn_tg_clear.setObjectName("actionBtn")
+        btn_tg_clear.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn_tg_clear.clicked.connect(lambda: self._tg_console.clear())
+        con_row.addWidget(btn_tg_clear)
+        left_lay.addLayout(con_row)
+
+        self._tg_console = QTextEdit()
+        self._tg_console.setObjectName("console")
+        self._tg_console.setReadOnly(True)
+        self._tg_console.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        left_lay.addWidget(self._tg_console, 1)
+
+        hlay.addWidget(left, 35)
+
+        # ── Right panel: Full Settings Form (ScrollArea) ──
+        right = QWidget()
+        right.setObjectName("panelRight")
+        right_lay = QVBoxLayout(right)
+        right_lay.setContentsMargins(0, 0, 0, 0)
+        right_lay.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setObjectName("utilsScrollArea")
+
+        content = QWidget()
+        content_lay = QVBoxLayout(content)
+        content_lay.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinimumSize)
+        content_lay.setContentsMargins(18, 14, 20, 16)
+        content_lay.setSpacing(12)
+
+        # Section 1: MTProto Connection
+        s1_lbl = QLabel("CONNECTION (MTPROTO)")
+        s1_lbl.setObjectName("sectionLbl")
+        content_lay.addWidget(s1_lbl)
+
+        row_host_port = QHBoxLayout()
+        row_host_port.setSpacing(10)
+
+        col_host = QVBoxLayout()
+        col_host.setSpacing(4)
+        lbl_h = QLabel("Host / IP Address")
+        lbl_h.setStyleSheet("color: #777; font-size: 11px;")
+        self._tg_inp_host = QLineEdit()
+        self._tg_inp_host.setToolTip("Proxy listen address (usually 127.0.0.1 or 0.0.0.0)")
+        col_host.addWidget(lbl_h)
+        col_host.addWidget(self._tg_inp_host)
+        row_host_port.addLayout(col_host, 2)
+
+        col_port = QVBoxLayout()
+        col_port.setSpacing(4)
+        lbl_p = QLabel("Port")
+        lbl_p.setStyleSheet("color: #777; font-size: 11px;")
+        self._tg_inp_port = QLineEdit()
+        self._tg_inp_port.setToolTip("Proxy port (1-65535, default: 1443)")
+        col_port.addWidget(lbl_p)
+        col_port.addWidget(self._tg_inp_port)
+        row_host_port.addLayout(col_port, 1)
+        content_lay.addLayout(row_host_port)
+
+        col_sec = QVBoxLayout()
+        col_sec.setSpacing(4)
+        lbl_s = QLabel("Secret Key (32 hex characters)")
+        lbl_s.setStyleSheet("color: #777; font-size: 11px;")
+        sec_row = QHBoxLayout()
+        sec_row.setSpacing(6)
+        self._tg_inp_secret = QLineEdit()
+        self._tg_inp_secret.setToolTip("32-character hexadecimal secret key")
+        btn_gen_sec = QPushButton("↺")
+        btn_gen_sec.setObjectName("iconBtn")
+        btn_gen_sec.setFixedSize(32, 32)
+        btn_gen_sec.setToolTip("Generate random secret")
+        btn_gen_sec.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn_gen_sec.clicked.connect(self._tg_generate_secret)
+        sec_row.addWidget(self._tg_inp_secret, 1)
+        sec_row.addWidget(btn_gen_sec)
+        col_sec.addWidget(lbl_s)
+        col_sec.addLayout(sec_row)
+        content_lay.addLayout(col_sec)
+
+        content_lay.addSpacing(14)
+
+        # Section 2: Data Centers (DC → IP)
+        s2_lbl = QLabel("TELEGRAM DATA CENTERS (DC → IP)")
+        s2_lbl.setObjectName("sectionLbl")
+        content_lay.addWidget(s2_lbl)
+
+        dc_hint = QLabel("One rule per line, format: DC:IP (e.g. 2:149.154.167.220)")
+        dc_hint.setStyleSheet("color: #555; font-size: 11px;")
+        content_lay.addWidget(dc_hint)
+
+        self._tg_txt_dc = QTextEdit()
+        self._tg_txt_dc.setObjectName("settingText")
+        self._tg_txt_dc.setFixedHeight(68)
+        self._tg_txt_dc.setToolTip("Mapping of Telegram DC to server IP")
+        content_lay.addWidget(self._tg_txt_dc)
+
+        content_lay.addSpacing(20)
+
+        # Section 3: Cloudflare Proxy
+        s3_lbl = QLabel("CLOUDFLARE PROXY")
+        s3_lbl.setObjectName("sectionLbl")
+        content_lay.addWidget(s3_lbl)
+
+        cf_top_row = QHBoxLayout()
+        cf_top_row.setSpacing(12)
+        self._tg_chk_cfproxy = QCheckBox("Enable CF-proxy")
+        self._tg_chk_cfproxy.setToolTip("Route blocked Telegram data centers via Cloudflare proxy")
+        self._btn_test_cfproxy = QPushButton("Test CF-Proxy")
+        self._btn_test_cfproxy.setObjectName("actionBtn")
+        self._btn_test_cfproxy.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_test_cfproxy.clicked.connect(self._tg_start_cfproxy_test)
+        cf_top_row.addWidget(self._tg_chk_cfproxy)
+        cf_top_row.addStretch()
+        cf_top_row.addWidget(self._btn_test_cfproxy)
+        content_lay.addLayout(cf_top_row)
+
+        self._tg_chk_h2 = QCheckBox("Media multiplexing (HTTP/2)")
+        self._tg_chk_h2.setToolTip("Multiplex media downloads through Cloudflare into a single HTTP/2 connection")
+        content_lay.addWidget(self._tg_chk_h2)
+
+        cf_custom_row = QHBoxLayout()
+        cf_custom_row.setSpacing(8)
+        self._tg_chk_custom_cf = QCheckBox("Custom domains:")
+        self._tg_chk_custom_cf.setToolTip("Specify custom domains instead of automatic domain selection")
+        self._tg_inp_custom_cf = QLineEdit()
+        self._tg_inp_custom_cf.setPlaceholderText("example1.com, example2.com")
+        self._tg_inp_custom_cf.setToolTip("Custom domains proxied through Cloudflare (comma-separated)")
+        cf_custom_row.addWidget(self._tg_chk_custom_cf)
+        cf_custom_row.addWidget(self._tg_inp_custom_cf, 1)
+        content_lay.addLayout(cf_custom_row)
+
+        content_lay.addSpacing(16)
+
+        # Section 4: Cloudflare Worker
+        s4_lbl = QLabel("CLOUDFLARE WORKER")
+        s4_lbl.setObjectName("sectionLbl")
+        content_lay.addWidget(s4_lbl)
+
+        cfw_top_row = QHBoxLayout()
+        cfw_top_row.setSpacing(12)
+        self._tg_chk_cfworker = QCheckBox("Enable CF Worker")
+        self._tg_chk_cfworker.setToolTip("Route Telegram traffic through custom Cloudflare Worker script")
+        self._btn_test_cfworker = QPushButton("Test CF Worker")
+        self._btn_test_cfworker.setObjectName("actionBtn")
+        self._btn_test_cfworker.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_test_cfworker.clicked.connect(self._tg_start_cfworker_test)
+        cfw_top_row.addWidget(self._tg_chk_cfworker)
+        cfw_top_row.addStretch()
+        cfw_top_row.addWidget(self._btn_test_cfworker)
+        content_lay.addLayout(cfw_top_row)
+
+        cfw_inp_row = QHBoxLayout()
+        cfw_inp_row.setSpacing(8)
+        lbl_w = QLabel("Worker domains:")
+        lbl_w.setStyleSheet("color: #777; font-size: 11px;")
+        self._tg_inp_cfworker = QLineEdit()
+        self._tg_inp_cfworker.setPlaceholderText("name.account.workers.dev")
+        self._tg_inp_cfworker.setToolTip("Cloudflare Worker domains (comma-separated)")
+        cfw_inp_row.addWidget(lbl_w)
+        cfw_inp_row.addWidget(self._tg_inp_cfworker, 1)
+        content_lay.addLayout(cfw_inp_row)
+
+        content_lay.addSpacing(16)
+
+        # Section 5: Logs & Performance
+        s5_lbl = QLabel("LOGS & PERFORMANCE")
+        s5_lbl.setObjectName("sectionLbl")
+        content_lay.addWidget(s5_lbl)
+
+        logs_chk_row = QHBoxLayout()
+        logs_chk_row.setSpacing(16)
+        self._tg_chk_verbose = QCheckBox("Verbose logging")
+        self._tg_chk_verbose.setToolTip("Write detailed debug logs to proxy.log")
+        self._tg_chk_no_secure = QCheckBox("Disable TLS (plain HTTP)")
+        self._tg_chk_no_secure.setToolTip("Use port 80 without TLS encryption for CF-proxy & CF-worker")
+        logs_chk_row.addWidget(self._tg_chk_verbose)
+        logs_chk_row.addWidget(self._tg_chk_no_secure)
+        logs_chk_row.addStretch()
+        content_lay.addLayout(logs_chk_row)
+
+        perf_row = QHBoxLayout()
+        perf_row.setSpacing(10)
+
+        col_buf = QVBoxLayout()
+        col_buf.setSpacing(4)
+        lbl_buf = QLabel("Buffer (KB)")
+        lbl_buf.setStyleSheet("color: #777; font-size: 11px;")
+        self._tg_inp_buf = QLineEdit()
+        self._tg_inp_buf.setToolTip("Socket buffer size in KB (default: 256)")
+        col_buf.addWidget(lbl_buf)
+        col_buf.addWidget(self._tg_inp_buf)
+        perf_row.addLayout(col_buf, 1)
+
+        col_pool = QVBoxLayout()
+        col_pool.setSpacing(4)
+        lbl_pool = QLabel("WS Pool Size")
+        lbl_pool.setStyleSheet("color: #777; font-size: 11px;")
+        self._tg_inp_pool = QLineEdit()
+        self._tg_inp_pool.setToolTip("Ready WebSocket connections pool per DC (default: 4)")
+        col_pool.addWidget(lbl_pool)
+        col_pool.addWidget(self._tg_inp_pool)
+        perf_row.addLayout(col_pool, 1)
+
+        col_log_mb = QVBoxLayout()
+        col_log_mb.setSpacing(4)
+        lbl_lmb = QLabel("Max Log (MB)")
+        lbl_lmb.setStyleSheet("color: #777; font-size: 11px;")
+        self._tg_inp_log_mb = QLineEdit()
+        self._tg_inp_log_mb.setToolTip("Maximum size of proxy.log in MB (default: 5)")
+        col_log_mb.addWidget(lbl_lmb)
+        col_log_mb.addWidget(self._tg_inp_log_mb)
+        perf_row.addLayout(col_log_mb, 1)
+
+        content_lay.addLayout(perf_row)
+
+        content_lay.addSpacing(10)
+
+        # Section 6: Action buttons
+        act_row = QHBoxLayout()
+        act_row.setSpacing(10)
+
+        self._btn_tg_save = QPushButton("Save Settings")
+        self._btn_tg_save.setObjectName("createBtn")
+        self._btn_tg_save.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_tg_save.clicked.connect(self._tg_save_settings)
+
+        self._btn_tg_reset = QPushButton("Reset Defaults")
+        self._btn_tg_reset.setObjectName("actionBtn")
+        self._btn_tg_reset.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_tg_reset.clicked.connect(self._tg_reset_defaults)
+
+        act_row.addWidget(self._btn_tg_save)
+        act_row.addWidget(self._btn_tg_reset)
+        act_row.addStretch()
+        content_lay.addLayout(act_row)
+
+        self._tg_feedback_lbl = QLabel("")
+        self._tg_feedback_lbl.setStyleSheet("color: #888; font-size: 12px; font-weight: 600;")
+        content_lay.addWidget(self._tg_feedback_lbl)
+
+        content_lay.addStretch()
+
+        scroll.setWidget(content)
+        right_lay.addWidget(scroll)
+        hlay.addWidget(right, 65)
+
+        # Synchronize dependent widget states
+        self._tg_sync_subcontrols()
+        self._tg_chk_cfproxy.toggled.connect(self._tg_sync_subcontrols)
+        self._tg_chk_custom_cf.toggled.connect(self._tg_sync_subcontrols)
+        self._tg_chk_cfworker.toggled.connect(self._tg_sync_subcontrols)
+
+        # Populate form with current config
+        self._tg_populate_form(self._tg_config)
+        self._tg_refresh_status_ui()
+
+        return w
+
+    # ── TG WS Proxy Logic ─────────────────────────────────────────
+
+    def _tg_populate_form(self, cfg: dict):
+        defaults = default_tg_config()
+        self._tg_inp_host.setText(str(cfg.get("host", defaults["host"])))
+        self._tg_inp_port.setText(str(cfg.get("port", defaults["port"])))
+        self._tg_inp_secret.setText(str(cfg.get("secret", defaults["secret"])))
+
+        dc_list = cfg.get("dc_ip", defaults["dc_ip"])
+        if isinstance(dc_list, list):
+            self._tg_txt_dc.setPlainText("\n".join(str(x) for x in dc_list))
+        else:
+            self._tg_txt_dc.setPlainText(str(dc_list))
+
+        self._tg_chk_cfproxy.setChecked(bool(cfg.get("cfproxy", defaults["cfproxy"])))
+        self._tg_chk_h2.setChecked(bool(cfg.get("h2", defaults["h2"])))
+
+        user_domains = coerce_domain_list(cfg.get("cfproxy_user_domain", []))
+        self._tg_chk_custom_cf.setChecked(bool(cfg.get("cfproxy_user_domain_enabled", bool(user_domains))))
+        self._tg_inp_custom_cf.setText(", ".join(user_domains))
+
+        worker_domains = coerce_domain_list(cfg.get("cfproxy_worker_domain", []))
+        self._tg_chk_cfworker.setChecked(bool(cfg.get("cfproxy_worker_enabled", bool(worker_domains))))
+        self._tg_inp_cfworker.setText(", ".join(worker_domains))
+
+        self._tg_chk_verbose.setChecked(bool(cfg.get("verbose", defaults["verbose"])))
+        self._tg_chk_no_secure.setChecked(bool(cfg.get("no_secure", defaults["no_secure"])))
+
+        self._tg_inp_buf.setText(str(cfg.get("buf_kb", defaults["buf_kb"])))
+        self._tg_inp_pool.setText(str(cfg.get("pool_size", defaults["pool_size"])))
+        self._tg_inp_log_mb.setText(str(cfg.get("log_max_mb", defaults["log_max_mb"])))
+        self._chk_tg_autoconnect.setChecked(self._tg_auto_connect)
+
+    def _tg_sync_subcontrols(self):
+        cf_enabled = self._tg_chk_cfproxy.isChecked()
+        self._tg_chk_h2.setEnabled(cf_enabled)
+        self._tg_chk_custom_cf.setEnabled(cf_enabled)
+        self._tg_inp_custom_cf.setEnabled(cf_enabled and self._tg_chk_custom_cf.isChecked())
+        self._btn_test_cfproxy.setEnabled(cf_enabled)
+
+        cfw_enabled = self._tg_chk_cfworker.isChecked()
+        self._tg_inp_cfworker.setEnabled(cfw_enabled)
+        self._btn_test_cfworker.setEnabled(cfw_enabled)
+
+    def _tg_refresh_status_ui(self):
+        is_run = self._tg_manager.is_running()
+        host = self._tg_config.get("host", "127.0.0.1")
+        port = self._tg_config.get("port", 1443)
+        if is_run:
+            self._tg_status_lbl.setText("● ACTIVE")
+            self._tg_status_lbl.setStyleSheet(
+                "color: #ffffff; font-size: 13px; font-weight: 700; background: transparent; border: none;"
+            )
+            self._tg_info_lbl.setText(f"{host}:{port}  (running)")
+            self._btn_tg_toggle.setText("Stop Proxy")
+            self._btn_tg_toggle.setObjectName("stopBtn")
+        else:
+            self._tg_status_lbl.setText("○ STOPPED")
+            self._tg_status_lbl.setStyleSheet(
+                "color: #666666; font-size: 13px; font-weight: 700; background: transparent; border: none;"
+            )
+            self._tg_info_lbl.setText(f"{host}:{port}  (inactive)")
+            self._btn_tg_toggle.setText("Start Proxy")
+            self._btn_tg_toggle.setObjectName("startBtn")
+
+        self._btn_tg_toggle.style().unpolish(self._btn_tg_toggle)
+        self._btn_tg_toggle.style().polish(self._btn_tg_toggle)
+        if hasattr(self, "_tray"):
+            self._refresh_tray()
+
+    def _tg_toggle_proxy(self):
+        if self._tg_manager.is_running():
+            self._tg_stop_proxy()
+        else:
+            self._tg_start_proxy()
+
+    def _tg_start_proxy(self, silent: bool = False):
+        if not silent:
+            self._tg_log("Starting TG WS Proxy...", "white")
+        err_msg: list[str] = []
+        ok = self._tg_manager.start(self._tg_config, on_error=lambda msg: err_msg.append(msg))
+        self._tg_refresh_status_ui()
+        if ok:
+            host = self._tg_config.get("host", "127.0.0.1")
+            port = self._tg_config.get("port", 1443)
+            self._tg_log(f"TG WS Proxy listening on {host}:{port}", "white")
+        else:
+            reason = err_msg[0] if err_msg else "Could not start proxy (check port or address)"
+            self._tg_log(f"ERROR: {reason}", "white")
+
+    def _tg_start_proxy_silent(self):
+        self._tg_start_proxy(silent=True)
+
+    def _tg_stop_proxy(self, silent: bool = False):
+        self._tg_manager.stop()
+        self._tg_refresh_status_ui()
+        if not silent:
+            self._tg_log("TG WS Proxy stopped.", "dim")
+
+    def _tg_stop_proxy_silent(self):
+        self._tg_stop_proxy(silent=True)
+
+    def _tg_restart_proxy(self):
+        self._tg_log("Restarting TG WS Proxy...", "white")
+        err_msg: list[str] = []
+        ok = self._tg_manager.restart(self._tg_config, on_error=lambda msg: err_msg.append(msg))
+        self._tg_refresh_status_ui()
+        if ok:
+            host = self._tg_config.get("host", "127.0.0.1")
+            port = self._tg_config.get("port", 1443)
+            self._tg_log(f"TG WS Proxy restarted on {host}:{port}", "white")
+        else:
+            reason = err_msg[0] if err_msg else "Restart failed"
+            self._tg_log(f"ERROR: {reason}", "white")
+
+    def _tg_open_telegram(self):
+        url = self._tg_manager.get_url(self._tg_config)
+        self._tg_log(f"Opening in Telegram: {url}", "dim")
+        opened = False
+        try:
+            if sys.platform == "win32":
+                os.startfile(url)
+                opened = True
+            else:
+                import webbrowser
+                opened = webbrowser.open(url)
+        except Exception as e:
+            self._tg_log(f"System open failed: {e}, copying to clipboard instead.", "dim")
+
+        if not opened:
+            QApplication.clipboard().setText(url)
+            self._tg_log("Link copied to clipboard.", "white")
+
+    def _tg_copy_link(self):
+        url = self._tg_manager.get_url(self._tg_config)
+        QApplication.clipboard().setText(url)
+        self._tg_log(f"Proxy link copied to clipboard: {url}", "white")
+        self._btn_tg_copy.setText("✓ Link Copied!")
+        QTimer.singleShot(2000, lambda: self._btn_tg_copy.setText("Copy Proxy Link"))
+
+    def _tg_open_log_file(self):
+        log_f = self._tg_manager.log_file
+        if log_f.exists():
+            try:
+                os.startfile(str(log_f))
+                self._tg_log(f"Opened log file: {log_f}", "dim")
+            except Exception as e:
+                self._tg_log(f"Error opening log: {e}", "white")
+        else:
+            self._tg_log(f"Log file not yet created: {log_f}", "dim")
+
+    def _tg_on_autoconnect_toggled(self, checked: bool):
+        self._tg_auto_connect = checked
+        self._tg_config["auto_connect"] = checked
+        self._save_settings()
+        self._tg_manager.set_config(self._tg_config)
+        self._tg_log(f"Auto-connect with start: {'enabled' if checked else 'disabled'}", "dim")
+
+    def _tg_generate_secret(self):
+        new_sec = os.urandom(16).hex()
+        self._tg_inp_secret.setText(new_sec)
+        self._tg_log("Generated new random secret.", "dim")
+
+    def _tg_save_settings(self):
+        values = {
+            "host": self._tg_inp_host.text(),
+            "port": self._tg_inp_port.text(),
+            "secret": self._tg_inp_secret.text(),
+            "dc_ip": self._tg_txt_dc.toPlainText(),
+            "cfproxy": self._tg_chk_cfproxy.isChecked(),
+            "h2": self._tg_chk_h2.isChecked(),
+            "cfproxy_user_domain_enabled": self._tg_chk_custom_cf.isChecked(),
+            "cfproxy_user_domain": self._tg_inp_custom_cf.text(),
+            "cfproxy_worker_enabled": self._tg_chk_cfworker.isChecked(),
+            "cfproxy_worker_domain": self._tg_inp_cfworker.text(),
+            "verbose": self._tg_chk_verbose.isChecked(),
+            "no_secure": self._tg_chk_no_secure.isChecked(),
+            "buf_kb": self._tg_inp_buf.text(),
+            "pool_size": self._tg_inp_pool.text(),
+            "log_max_mb": self._tg_inp_log_mb.text(),
+            "auto_connect": self._chk_tg_autoconnect.isChecked(),
+        }
+        valid_cfg, err = validate_tg_settings(values, default_tg_config())
+        if err:
+            self._tg_feedback_lbl.setText(f"✗ {err}")
+            self._tg_feedback_lbl.setStyleSheet("color: #ff6666; font-size: 12px; font-weight: 600;")
+            self._tg_log(f"Settings error: {err}", "white")
+            return
+
+        self._tg_config = valid_cfg
+        self._tg_auto_connect = valid_cfg.get("auto_connect", False)
+        self._save_settings()
+        self._tg_manager.set_config(valid_cfg)
+
+        was_running = self._tg_manager.is_running()
+        if was_running:
+            self._tg_log("Applying settings and restarting proxy...", "dim")
+            self._tg_manager.restart(valid_cfg, on_error=lambda msg: self._tg_log(f"Proxy error: {msg}", "white"))
+        else:
+            self._tg_log("Settings saved successfully.", "dim")
+
+        self._tg_refresh_status_ui()
+        self._tg_feedback_lbl.setText("✓ Settings saved and applied!")
+        self._tg_feedback_lbl.setStyleSheet("color: #ffffff; font-size: 12px; font-weight: 600;")
+        QTimer.singleShot(3000, lambda: self._tg_feedback_lbl.setText(""))
+
+    def _tg_reset_defaults(self):
+        defs = default_tg_config()
+        self._tg_populate_form(defs)
+        self._tg_log("Reset form fields to default values. Click 'Save Settings' to apply.", "dim")
+        self._tg_feedback_lbl.setText("Reset to defaults. Remember to click 'Save Settings'.")
+        self._tg_feedback_lbl.setStyleSheet("color: #888888; font-size: 12px; font-weight: 600;")
+        QTimer.singleShot(3500, lambda: self._tg_feedback_lbl.setText(""))
+
+    def _tg_start_cfproxy_test(self):
+        if self._cfproxy_test_worker and self._cfproxy_test_worker.isRunning():
+            return
+        custom_domains = (
+            coerce_domain_list(self._tg_inp_custom_cf.text())
+            if self._tg_chk_custom_cf.isChecked() else []
+        )
+        secure = not self._tg_chk_no_secure.isChecked()
+        self._btn_test_cfproxy.setEnabled(False)
+        self._btn_test_cfproxy.setText("Testing...")
+        self._cfproxy_test_worker = CfProxyTestWorker(custom_domains, secure=secure)
+        self._cfproxy_test_worker.log.connect(self._tg_log)
+        self._cfproxy_test_worker.finished_test.connect(self._on_cfproxy_test_finished)
+        self._cfproxy_test_worker.start()
+
+    def _on_cfproxy_test_finished(self, ok: bool, summary: str):
+        self._btn_test_cfproxy.setEnabled(True)
+        self._btn_test_cfproxy.setText("Test CF-Proxy")
+
+    def _tg_start_cfworker_test(self):
+        if self._cfworker_test_worker and self._cfworker_test_worker.isRunning():
+            return
+        worker_domains = coerce_domain_list(self._tg_inp_cfworker.text())
+        secure = not self._tg_chk_no_secure.isChecked()
+        self._btn_test_cfworker.setEnabled(False)
+        self._btn_test_cfworker.setText("Testing...")
+        self._cfworker_test_worker = CfWorkerTestWorker(worker_domains, secure=secure)
+        self._cfworker_test_worker.log.connect(self._tg_log)
+        self._cfworker_test_worker.finished_test.connect(self._on_cfworker_test_finished)
+        self._cfworker_test_worker.start()
+
+    def _on_cfworker_test_finished(self, ok: bool, summary: str):
+        self._btn_test_cfworker.setEnabled(True)
+        self._btn_test_cfworker.setText("Test CF Worker")
+
+    def _tg_log(self, text: str, color: str = "white"):
+        COLORS = {
+            "white": "#bbb",
+            "dim": "#555",
+        }
+        hx = color if color.startswith("#") else COLORS.get(color, "#bbb")
+        ts = time.strftime("%H:%M:%S")
+        self._tg_console.append(
+            f'<span style="color:#222;">[{ts}]</span> '
+            f'<span style="color:{hx};">{text}</span>'
+        )
+        sb = self._tg_console.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
     # ── Tray ──────────────────────────────────────────────────────
 
     def _setup_tray(self):
@@ -1834,15 +3173,22 @@ class MainWindow(QMainWindow):
         self._act_open = QAction("Open", self)
         self._act_conn = QAction("Connect", self)
         self._act_disc = QAction("Disconnect", self)
+        self._act_tg_on = QAction("on tg-proxy", self)
+        self._act_tg_off = QAction("off tg-proxy", self)
         self._act_exit = QAction("Exit", self)
         self._act_open.triggered.connect(self._restore)
         self._act_conn.triggered.connect(self._connect)
         self._act_disc.triggered.connect(self._disconnect)
+        self._act_tg_on.triggered.connect(lambda: self._tg_start_proxy())
+        self._act_tg_off.triggered.connect(lambda: self._tg_stop_proxy())
         self._act_exit.triggered.connect(self._exit_app)
         m.addAction(self._act_open)
         m.addSeparator()
         m.addAction(self._act_conn)
         m.addAction(self._act_disc)
+        m.addSeparator()
+        m.addAction(self._act_tg_on)
+        m.addAction(self._act_tg_off)
         m.addSeparator()
         m.addAction(self._act_exit)
         self._tray.setContextMenu(m)
@@ -1866,6 +3212,12 @@ class MainWindow(QMainWindow):
             self._test_selected_worker.stop()
         if self._create_worker and self._create_worker.isRunning():
             self._create_worker.stop()
+        if hasattr(self, "_cfproxy_test_worker") and self._cfproxy_test_worker and self._cfproxy_test_worker.isRunning():
+            self._cfproxy_test_worker.stop()
+        if hasattr(self, "_cfworker_test_worker") and self._cfworker_test_worker and self._cfworker_test_worker.isRunning():
+            self._cfworker_test_worker.stop()
+        if hasattr(self, "_tg_manager"):
+            self._tg_manager.stop()
         self._disconnect()
         self._tray.hide()
         QApplication.quit()
@@ -1874,6 +3226,10 @@ class MainWindow(QMainWindow):
         self._act_conn.setVisible(not self._connected)
         self._act_disc.setVisible(self._connected)
         self._tray.setIcon(_make_tray_icon(self._connected))
+        if hasattr(self, "_act_tg_on") and hasattr(self, "_act_tg_off") and hasattr(self, "_tg_manager"):
+            is_tg = self._tg_manager.is_running()
+            self._act_tg_on.setVisible(not is_tg)
+            self._act_tg_off.setVisible(is_tg)
 
     # ── Window events ─────────────────────────────────────────────
 
@@ -2122,6 +3478,11 @@ class MainWindow(QMainWindow):
         self._save_settings()
         self._log(f"Auto-connect {'enabled' if v else 'disabled'}", "dim")
 
+    def _on_multi_ping_toggled(self, checked: bool):
+        self._multi_ping = checked
+        self._save_settings()
+        self._log(f"Multi-ping {'enabled (3 configs)' if checked else 'disabled (sequential)'}", "dim")
+
     def _console_clear(self):
         self._console.clear()
 
@@ -2180,7 +3541,7 @@ class MainWindow(QMainWindow):
         self._btn_test.style().polish(self._btn_test)
         self._btn_test_selected.setEnabled(False)
 
-        self._test_worker = TestWorker(self._bat_files, self._zapret_dir, was_connected)
+        self._test_worker = TestWorker(self._bat_files, self._zapret_dir, was_connected, multi_ping=self._multi_ping)
         self._test_worker.log.connect(self._log)
         self._test_worker.result.connect(self._results.setPlainText)
         self._test_worker.ranked.connect(self._on_test_all_ranked)
@@ -2282,7 +3643,7 @@ class MainWindow(QMainWindow):
         self._chk_target_youtube.setEnabled(False)
         self._slider_num_configs.setEnabled(False)
 
-        self._create_worker = CreateWorker(self._zapret_dir, target_discord, target_youtube, num_configs)
+        self._create_worker = CreateWorker(self._zapret_dir, target_discord, target_youtube, num_configs, multi_ping=self._multi_ping)
         self._create_worker.log.connect(self._create_log)
         self._create_worker.success.connect(self._on_create_success)
         self._create_worker.finished.connect(self._on_create_done)
@@ -2312,7 +3673,7 @@ class MainWindow(QMainWindow):
             "white": "#bbb",
             "dim": "#555",
         }
-        hx = COLORS.get(color, "#bbb")
+        hx = color if color.startswith("#") else COLORS.get(color, "#bbb")
         ts = time.strftime("%H:%M:%S")
         self._create_console.append(
             f'<span style="color:#222;">[{ts}]</span> '
@@ -2328,7 +3689,7 @@ class MainWindow(QMainWindow):
             "white": "#bbb",
             "dim": "#555",
         }
-        hx = COLORS.get(color, "#bbb")
+        hx = color if color.startswith("#") else COLORS.get(color, "#bbb")
         ts = time.strftime("%H:%M:%S")
         self._console.append(
             f'<span style="color:#222;">[{ts}]</span> '
