@@ -17,15 +17,17 @@ import threading
 import time
 import winreg
 from pathlib import Path
+import urllib.request
 from urllib.parse import urlparse
 
 import psutil
-from PyQt6.QtCore import QSize, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QSize, Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QBrush,
     QColor,
     QCursor,
+    QDesktopServices,
     QFont,
     QIcon,
     QImage,
@@ -37,6 +39,8 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QColorDialog,
+    QDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -74,7 +78,7 @@ from tg_proxy_service import (
 # ══════════════════════════════════════════════════════════════════
 
 APP_NAME = "zapret++"
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 WINDOW_W, WINDOW_H = 800, 600  # 4:3
 
 # ══════════════════════════════════════════════════════════════════
@@ -109,9 +113,9 @@ def is_admin() -> bool:
         return False
 
 
-def apply_dark_titlebar(hwnd: int):
+def apply_dark_titlebar(hwnd: int, dark: bool = True):
     try:
-        val = ctypes.c_int(1)
+        val = ctypes.c_int(1 if dark else 0)
         ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(val), 4)
     except Exception:
         pass
@@ -557,341 +561,512 @@ def _make_tray_icon(connected: bool) -> QIcon:
 #  STYLESHEET — Windows 11 B&W minimalism
 # ══════════════════════════════════════════════════════════════════
 
-STYLE = """
-* {
-    font-family: 'Segoe UI', sans-serif;
-    margin: 0; padding: 0;
-}
+def _hex_to_rgb(h: str) -> tuple[int, int, int]:
+    h = h.strip().lstrip('#')
+    if len(h) == 3:
+        h = ''.join([c * 2 for c in h])
+    if len(h) != 6:
+        return (10, 10, 10)
+    try:
+        return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+    except Exception:
+        return (10, 10, 10)
 
-QMainWindow, QWidget {
-    background: #0a0a0a;
-}
+
+def _rgb_to_hex(rgb: tuple[int, int, int]) -> str:
+    return '#{:02x}{:02x}{:02x}'.format(*(max(0, min(255, int(v))) for v in rgb))
+
+
+def _blend_color(c1: str, c2: str, factor: float) -> str:
+    r1, g1, b1 = _hex_to_rgb(c1)
+    r2, g2, b2 = _hex_to_rgb(c2)
+    return _rgb_to_hex((
+        r1 + (r2 - r1) * factor,
+        g1 + (g2 - g1) * factor,
+        b1 + (b2 - b1) * factor,
+    ))
+
+
+def _is_dark_color(h: str) -> bool:
+    r, g, b = _hex_to_rgb(h)
+    return (0.299 * r + 0.587 * g + 0.114 * b) < 128
+
+
+def build_stylesheet(color1: str = "#0a0a0a", color2: str = "#ffffff", text_color: str = "#e0e0e0") -> str:
+    dark_theme = _is_dark_color(color1)
+    contrast_partner = "#ffffff" if dark_theme else "#000000"
+
+    bg_main = color1
+    bg_panel_left = _blend_color(color1, contrast_partner, 0.02)
+    bg_tab_bar = _blend_color(color1, contrast_partner, 0.035)
+    bg_card = _blend_color(color1, contrast_partner, 0.065)
+    bg_hover = _blend_color(color1, contrast_partner, 0.10)
+    bg_pressed = _blend_color(color1, contrast_partner, 0.04)
+    bg_input = _blend_color(color1, contrast_partner, 0.05)
+    bg_darker = _blend_color(color1, "#000000" if dark_theme else "#ffffff", 0.04)
+
+    border_dark = _blend_color(color1, contrast_partner, 0.12)
+    border_light = _blend_color(color1, contrast_partner, 0.22)
+
+    accent = color2
+    accent_hover = _blend_color(color2, color1, 0.15)
+    accent_text = color1 if not _is_dark_color(color2) else "#ffffff"
+
+    txt_primary = text_color
+    txt_dim = _blend_color(text_color, color1, 0.35)
+    txt_muted = _blend_color(text_color, color1, 0.55)
+    txt_disabled = _blend_color(text_color, color1, 0.70)
+
+    return f"""
+* {{
+    font-family: 'Segoe UI', sans-serif;
+}}
+
+QMainWindow, QWidget {{
+    background: {bg_main};
+    color: {txt_primary};
+}}
+
+QDialog {{
+    background: {bg_main};
+    color: {txt_primary};
+    border: 1px solid {border_light};
+    border-radius: 8px;
+}}
 
 /* ── Panels ── */
-QWidget#panelLeft {
-    background: #0d0d0d;
-}
-QWidget#panelRight {
-    background: #0a0a0a;
-}
-QWidget#panelDivider {
-    background: #181818;
+QWidget#panelLeft {{
+    background: {bg_panel_left};
+}}
+QWidget#panelRight {{
+    background: {bg_main};
+}}
+QWidget#panelDivider {{
+    background: {border_dark};
     min-width: 1px;
     max-width: 1px;
-}
+}}
 
 /* ── Tab bar ── */
-QWidget#tabBar {
-    background: #0f0f0f;
-    border-bottom: 1px solid #1a1a1a;
-}
-QPushButton#tab {
+QWidget#tabBar {{
+    background: {bg_tab_bar};
+    border-bottom: 1px solid {border_dark};
+}}
+QPushButton#tab {{
     background: transparent;
-    color: #555;
+    color: {txt_muted};
     border: none;
     border-bottom: 2px solid transparent;
     padding: 12px 0;
     font-size: 13px;
     font-weight: 600;
     letter-spacing: 0.5px;
-}
-QPushButton#tab:hover {
-    color: #888;
-    background: #111;
-}
-QPushButton#tab[active="true"] {
-    color: #e0e0e0;
-    border-bottom: 2px solid #ffffff;
-    background: #0a0a0a;
-}
+}}
+QPushButton#tab:hover {{
+    color: {txt_dim};
+    background: {bg_hover};
+}}
+QPushButton#tab[active="true"] {{
+    color: {txt_primary};
+    border-bottom: 2px solid {accent};
+    background: {bg_main};
+}}
+
+/* ── Side tabs for App Settings ── */
+QPushButton#settingsSideTab {{
+    background: transparent;
+    color: {txt_muted};
+    border: none;
+    border-left: 3px solid transparent;
+    padding: 10px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    text-align: left;
+    border-radius: 0px;
+}}
+QPushButton#settingsSideTab:hover {{
+    color: {txt_primary};
+    background: {bg_hover};
+}}
+QPushButton#settingsSideTab[active="true"] {{
+    color: {txt_primary};
+    border-left: 3px solid {accent};
+    background: {bg_card};
+}}
 
 /* ── Buttons ── */
-QPushButton#actionBtn {
-    background: #1a1a1a;
-    color: #bbb;
-    border: 1px solid #2a2a2a;
+QPushButton#actionBtn {{
+    background: {bg_card};
+    color: {txt_primary};
+    border: 1px solid {border_dark};
     border-radius: 6px;
     padding: 8px 18px;
     font-size: 12px;
     font-weight: 500;
-}
-QPushButton#actionBtn:hover {
-    background: #222;
-    border-color: #3a3a3a;
-    color: #eee;
-}
-QPushButton#actionBtn:pressed {
-    background: #151515;
-}
-QPushButton#actionBtn:disabled {
-    color: #444;
-    border-color: #1a1a1a;
-}
+}}
+QPushButton#actionBtn:hover {{
+    background: {bg_hover};
+    border-color: {border_light};
+    color: {accent};
+}}
+QPushButton#actionBtn:pressed {{
+    background: {bg_pressed};
+}}
+QPushButton#actionBtn:disabled {{
+    color: {txt_disabled};
+    border-color: {border_dark};
+}}
 
-QPushButton#testBtn {
-    background: #1a1a1a;
-    color: #ccc;
-    border: 1px solid #2a2a2a;
+QPushButton#testBtn {{
+    background: {bg_card};
+    color: {txt_primary};
+    border: 1px solid {border_dark};
     border-radius: 6px;
     padding: 8px 18px;
     font-size: 12px;
     font-weight: 600;
-}
-QPushButton#testBtn:hover {
-    background: #222;
-    border-color: #444;
-    color: #fff;
-}
-QPushButton#testBtn[testing="true"] {
-    background: #1a1a1a;
-    color: #999;
-    border-color: #333;
-}
+}}
+QPushButton#testBtn:hover {{
+    background: {bg_hover};
+    border-color: {border_light};
+    color: {accent};
+}}
+QPushButton#testBtn[testing="true"] {{
+    background: {bg_card};
+    color: {txt_dim};
+    border-color: {border_dark};
+}}
 
-QPushButton#startBtn {
-    background: #1a1a1a;
-    color: #ffffff;
-    border: 1px solid #2a2a2a;
+QPushButton#startBtn {{
+    background: {bg_card};
+    color: {accent};
+    border: 1px solid {border_dark};
     border-radius: 6px;
     padding: 8px 18px;
     font-size: 12px;
     font-weight: 600;
-}
-QPushButton#startBtn:hover {
-    background: #252525;
-    border-color: #444;
-    color: #ffffff;
-}
-QPushButton#startBtn:pressed {
-    background: #141414;
-    color: #ffffff;
-}
+}}
+QPushButton#startBtn:hover {{
+    background: {bg_hover};
+    border-color: {border_light};
+    color: {accent};
+}}
+QPushButton#startBtn:pressed {{
+    background: {bg_pressed};
+    color: {accent};
+}}
 
-QPushButton#stopBtn {
-    background: #1a1a1a;
-    color: #bbb;
-    border: 1px solid #2a2a2a;
+QPushButton#stopBtn {{
+    background: {bg_card};
+    color: {txt_primary};
+    border: 1px solid {border_dark};
     border-radius: 6px;
     padding: 8px 18px;
     font-size: 12px;
     font-weight: 600;
-}
-QPushButton#stopBtn:hover {
-    background: #222;
-    border-color: #444;
-    color: #eee;
-}
+}}
+QPushButton#stopBtn:hover {{
+    background: {bg_hover};
+    border-color: {border_light};
+    color: {accent};
+}}
 
-QPushButton#createBtn {
-    background: #ffffff;
-    color: #0a0a0a;
+QPushButton#createBtn {{
+    background: {accent};
+    color: {accent_text};
     border: none;
     border-radius: 6px;
     padding: 10px 24px;
     font-size: 13px;
     font-weight: 700;
-}
-QPushButton#createBtn:hover {
-    background: #e0e0e0;
-}
-QPushButton#createBtn:disabled {
-    background: #333;
-    color: #666;
-}
+}}
+QPushButton#createBtn:hover {{
+    background: {accent_hover};
+}}
+QPushButton#createBtn:disabled {{
+    background: {border_dark};
+    color: {txt_disabled};
+}}
 
 /* ── List widget ── */
-QListWidget {
-    background: #0f0f0f;
-    color: #999;
-    border: 1px solid #1a1a1a;
+QListWidget {{
+    background: {bg_tab_bar};
+    color: {txt_dim};
+    border: 1px solid {border_dark};
     border-radius: 6px;
     font-size: 12px;
     outline: none;
     padding: 4px;
-}
-QListWidget::item {
+}}
+QListWidget::item {{
     padding: 10px 12px;
     border-radius: 4px;
     border-left: 3px solid transparent;
     margin: 1px 0;
-}
-QListWidget::item:hover {
-    background: #141414;
-    color: #bbb;
-}
-QListWidget::item:selected {
-    background: #181818;
-    color: #e0e0e0;
-    border-left: 3px solid #ffffff;
-}
+}}
+QListWidget::item:hover {{
+    background: {bg_hover};
+    color: {txt_primary};
+}}
+QListWidget::item:selected {{
+    background: {bg_card};
+    color: {txt_primary};
+    border-left: 3px solid {accent};
+}}
 
 /* ── CheckBox ── */
-QCheckBox {
-    color: #777;
+QCheckBox {{
+    color: {txt_primary};
     font-size: 12px;
     spacing: 7px;
-}
-QCheckBox::indicator {
+    background: transparent;
+}}
+QCheckBox::indicator {{
     width: 15px; height: 15px;
-    border: 1px solid #333;
+    border: 1px solid {border_light};
     border-radius: 3px;
-    background: #141414;
-}
-QCheckBox::indicator:checked {
-    background: #ffffff;
-    border-color: #ffffff;
-}
-QCheckBox:hover {
-    color: #aaa;
-}
+    background: {bg_card};
+}}
+QCheckBox::indicator:checked {{
+    background: {accent};
+    border-color: {accent};
+}}
+QCheckBox:hover {{
+    color: {accent};
+}}
 
 /* ── Console ── */
-QTextEdit#console {
-    background: #080808;
-    color: #999;
-    border: 1px solid #151515;
+QTextEdit#console {{
+    background: {bg_darker};
+    color: {txt_dim};
+    border: 1px solid {border_dark};
     border-radius: 6px;
     font-family: 'Cascadia Code', 'Consolas', monospace;
     font-size: 11px;
     padding: 8px;
-}
+}}
 
 /* ── Inputs & Utils Form ── */
-QLineEdit {
-    background: #111111;
-    color: #cccccc;
-    border: 1px solid #222222;
+QLineEdit {{
+    background: {bg_card};
+    color: {txt_primary};
+    border: 1px solid {border_dark};
     border-radius: 6px;
     padding: 6px 10px;
     font-size: 12px;
-}
-QLineEdit:focus {
-    border: 1px solid #444444;
-    background: #141414;
-    color: #ffffff;
-}
-QLineEdit:disabled {
-    color: #444444;
-    background: #0d0d0d;
-    border-color: #1a1a1a;
-}
+}}
+QLineEdit:focus {{
+    border: 1px solid {border_light};
+    background: {bg_input};
+    color: {accent};
+}}
+QLineEdit:disabled {{
+    color: {txt_disabled};
+    background: {bg_panel_left};
+    border-color: {border_dark};
+}}
 
-QTextEdit#settingText {
-    background: #111111;
-    color: #cccccc;
-    border: 1px solid #222222;
+QTextEdit#settingText {{
+    background: {bg_card};
+    color: {txt_primary};
+    border: 1px solid {border_dark};
     border-radius: 6px;
     padding: 6px 10px;
     font-family: 'Cascadia Code', 'Consolas', monospace;
     font-size: 11px;
-}
-QTextEdit#settingText:focus {
-    border: 1px solid #444444;
-    color: #ffffff;
-}
+}}
+QTextEdit#settingText:focus {{
+    border: 1px solid {border_light};
+    color: {accent};
+}}
 
-QScrollArea {
+QScrollArea {{
     border: none;
     background: transparent;
-}
-QScrollArea > QWidget > QWidget {
+}}
+QScrollArea > QWidget > QWidget {{
     background: transparent;
-}
+}}
 
-QPushButton#iconBtn {
-    background: #1a1a1a;
-    color: #bbb;
-    border: 1px solid #2a2a2a;
+QPushButton#iconBtn {{
+    background: {bg_card};
+    color: {txt_primary};
+    border: 1px solid {border_dark};
     border-radius: 6px;
     font-size: 14px;
     font-weight: 600;
-}
-QPushButton#iconBtn:hover {
-    background: #252525;
-    border-color: #444;
-    color: #fff;
-}
-
+}}
+QPushButton#iconBtn:hover {{
+    background: {bg_hover};
+    border-color: {border_light};
+    color: {accent};
+}}
 
 /* ── ScrollBar ── */
-QScrollBar:vertical {
-    background: #0d0d0d;
+QScrollBar:vertical {{
+    background: {bg_panel_left};
     width: 6px;
     border: none;
     margin: 0;
     padding: 0;
-}
-QScrollBar::handle:vertical {
-    background: #2a2a2a;
+}}
+QScrollBar::handle:vertical {{
+    background: {border_dark};
     border-radius: 3px;
     min-height: 24px;
     border: none;
-}
-QScrollBar::handle:vertical:hover {
-    background: #3a3a3a;
-}
+}}
+QScrollBar::handle:vertical:hover {{
+    background: {border_light};
+}}
 QScrollBar::add-line:vertical,
-QScrollBar::sub-line:vertical {
+QScrollBar::sub-line:vertical {{
     height: 0;
     border: none;
     background: none;
-}
+}}
 QScrollBar::add-page:vertical,
-QScrollBar::sub-page:vertical {
+QScrollBar::sub-page:vertical {{
     background: none;
     border: none;
-}
-QScrollBar:horizontal {
+}}
+QScrollBar:horizontal {{
     height: 0;
     background: none;
     border: none;
-}
+}}
 
 /* ── Status bar ── */
-QLabel#statusBar {
-    background: #060606;
-    color: #333;
+QLabel#statusBar {{
+    background: {bg_darker};
+    color: {txt_disabled};
     font-size: 11px;
-    border-top: 1px solid #111;
+    border-top: 1px solid {border_dark};
     padding: 0 14px;
-}
+}}
 
 /* ── Section labels ── */
-QLabel#sectionLbl {
-    color: #555;
+QLabel#sectionLbl {{
+    color: {txt_muted};
     font-size: 10px;
     font-weight: 700;
     letter-spacing: 1.5px;
     background: transparent;
-}
+}}
 
 /* ── Info label ── */
-QLabel#infoLbl {
-    color: #555;
+QLabel#infoLbl {{
+    color: {txt_muted};
     font-size: 11px;
     background: transparent;
-}
+}}
 
 /* ── Tray menu ── */
-QMenu {
-    background: #111;
-    color: #bbb;
-    border: 1px solid #222;
+QMenu {{
+    background: {bg_card};
+    color: {txt_primary};
+    border: 1px solid {border_dark};
     font-size: 12px;
-}
-QMenu::item {
+}}
+QMenu::item {{
     padding: 6px 20px;
-}
-QMenu::item:selected {
-    background: #1a1a1a;
-    color: #eee;
-}
-QMenu::separator {
-    background: #1e1e1e;
+}}
+QMenu::item:selected {{
+    background: {bg_hover};
+    color: {accent};
+}}
+QMenu::separator {{
+    background: {border_dark};
     height: 1px;
     margin: 3px 0;
-}
+}}
+
+/* ── Sliders ── */
+QSlider::groove:horizontal {{
+    background: {border_dark};
+    height: 4px;
+    border-radius: 2px;
+}}
+QSlider::handle:horizontal {{
+    background: {accent};
+    width: 14px;
+    height: 14px;
+    margin: -5px 0;
+    border-radius: 7px;
+}}
+QSlider::handle:horizontal:hover {{
+    background: {accent_hover};
+}}
+QSlider::sub-page:horizontal {{
+    background: {accent};
+    border-radius: 2px;
+}}
+QSlider::add-page:horizontal {{
+    background: {border_dark};
+    border-radius: 2px;
+}}
+
+/* ── Color Dialog ── */
+QColorDialog {{
+    background: {bg_main};
+}}
+QColorDialog QLabel {{
+    color: {txt_primary};
+    background: transparent;
+}}
+QColorDialog QLineEdit,
+QColorDialog QSpinBox {{
+    background: {bg_card};
+    color: {txt_primary};
+    border: 1px solid {border_dark};
+    border-radius: 4px;
+    padding: 3px 6px;
+    selection-background-color: {border_light};
+}}
+QColorDialog QLineEdit:focus,
+QColorDialog QSpinBox:focus {{
+    border-color: {accent};
+}}
+QColorDialog QPushButton {{
+    background: {bg_card};
+    color: {txt_primary};
+    border: 1px solid {border_dark};
+    border-radius: 6px;
+    padding: 6px 14px;
+    min-height: 24px;
+    font-size: 12px;
+    font-weight: 500;
+}}
+QColorDialog QPushButton:hover {{
+    background: {bg_hover};
+    border-color: {border_light};
+    color: {accent};
+}}
+QColorDialog QPushButton:pressed {{
+    background: {bg_pressed};
+}}
+QColorDialog QDialogButtonBox QPushButton {{
+    min-width: 82px;
+    min-height: 28px;
+    padding: 6px 18px;
+    margin-left: 8px;
+    font-weight: 500;
+}}
+QColorDialog QDialogButtonBox QPushButton:default {{
+    background: {accent};
+    color: {bg_main};
+    border: 1px solid {accent};
+    font-weight: 600;
+}}
+QColorDialog QDialogButtonBox QPushButton:default:hover {{
+    background: {accent_hover};
+    border-color: {accent_hover};
+    color: {bg_main};
+}}
 """
+
+
+STYLE = build_stylesheet("#0a0a0a", "#ffffff", "#e0e0e0")
 
 # ══════════════════════════════════════════════════════════════════
 #  POWER BUTTON (3 states: off / pending / on)
@@ -965,6 +1140,11 @@ class PowerButton(QLabel):
             self._state = state
             self._refresh()
 
+    def set_theme(self, bg_color: str, accent_color: str):
+        self._bg_color = bg_color
+        self._accent_color = accent_color
+        self._refresh()
+
     @property
     def state(self):
         return self._state
@@ -972,6 +1152,185 @@ class PowerButton(QLabel):
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit()
+
+
+# ══════════════════════════════════════════════════════════════════
+#  CUSTOM WIDGETS & UPDATE WORKER
+# ══════════════════════════════════════════════════════════════════
+
+class ToggleSwitch(QWidget):
+    toggled = pyqtSignal(bool)
+
+    def __init__(self, checked: bool = True, parent=None):
+        super().__init__(parent)
+        self._checked = checked
+        self.setFixedSize(44, 24)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._accent_color = "#ffffff"
+        self._bg_color = "#0a0a0a"
+
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def setChecked(self, checked: bool):
+        if self._checked != checked:
+            self._checked = checked
+            self.update()
+            self.toggled.emit(self._checked)
+
+    def set_colors(self, accent: str, bg: str):
+        self._accent_color = accent
+        self._bg_color = bg
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.setChecked(not self._checked)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        r = self.rect()
+        if self._checked:
+            track_brush = QBrush(QColor(self._accent_color))
+            track_pen = QPen(QColor(self._accent_color), 1)
+            thumb_color = QColor(self._bg_color)
+            thumb_x = r.width() - 21
+        else:
+            track_brush = QBrush(QColor("#242424"))
+            track_pen = QPen(QColor("#404040"), 1)
+            thumb_color = QColor("#888888")
+            thumb_x = 3
+
+        p.setBrush(track_brush)
+        p.setPen(track_pen)
+        p.drawRoundedRect(1, 1, r.width() - 2, r.height() - 2, 11, 11)
+
+        p.setBrush(QBrush(thumb_color))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(thumb_x, 3, 18, 18)
+        p.end()
+
+
+def parse_version(v_str: str) -> tuple[int, ...]:
+    clean = re.sub(r'^[^\d]*', '', v_str.strip())
+    parts = []
+    for piece in clean.split('.'):
+        num_m = re.match(r'^\d+', piece)
+        if num_m:
+            parts.append(int(num_m.group(0)))
+        else:
+            break
+    return tuple(parts) if parts else (0,)
+
+
+def is_newer_version(remote: str, local: str) -> bool:
+    return parse_version(remote) > parse_version(local)
+
+
+class NewUpdateDialog(QDialog):
+    def __init__(self, new_tag: str, current_ver: str, stylesheet: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("New update")
+        self.setFixedSize(380, 200)
+        self.setModal(True)
+        self.setStyleSheet(stylesheet)
+
+        vlay = QVBoxLayout(self)
+        vlay.setContentsMargins(28, 24, 28, 24)
+        vlay.setSpacing(14)
+
+        lbl_title = QLabel("New update")
+        lbl_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_title.setStyleSheet("font-size: 20px; font-weight: 700; letter-spacing: 0.5px; background: transparent;")
+        vlay.addWidget(lbl_title)
+
+        lbl_info = QLabel(f"A new version is available: {new_tag}\nCurrent version: v{current_ver}")
+        lbl_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_info.setStyleSheet("font-size: 13px; color: #888888; background: transparent;")
+        vlay.addWidget(lbl_info)
+
+        vlay.addStretch()
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(14)
+
+        self._btn_back = QPushButton("back")
+        self._btn_back.setObjectName("actionBtn")
+        self._btn_back.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_back.setFixedHeight(36)
+        self._btn_back.clicked.connect(self.reject)
+
+        self._btn_download = QPushButton("download")
+        self._btn_download.setObjectName("createBtn")
+        self._btn_download.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_download.setFixedHeight(36)
+        self._btn_download.clicked.connect(self._download)
+
+        btn_row.addWidget(self._btn_back)
+        btn_row.addWidget(self._btn_download)
+        vlay.addLayout(btn_row)
+
+    def _download(self):
+        QDesktopServices.openUrl(QUrl("https://github.com/bpm500/zapret_pp/releases"))
+        self.accept()
+
+
+class UpdateCheckWorker(QThread):
+    finished = pyqtSignal(bool, str)
+
+    def run(self):
+        try:
+            # 1. API releases/latest
+            try:
+                req = urllib.request.Request(
+                    "https://api.github.com/repos/bpm500/zapret_pp/releases/latest",
+                    headers={"User-Agent": "zapret_pp"}
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    tag = data.get("tag_name")
+                    if tag:
+                        self.finished.emit(True, str(tag))
+                        return
+            except Exception:
+                pass
+
+            # 2. API tags
+            try:
+                req = urllib.request.Request(
+                    "https://api.github.com/repos/bpm500/zapret_pp/tags",
+                    headers={"User-Agent": "zapret_pp"}
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    tags = json.loads(resp.read().decode("utf-8"))
+                    if tags and isinstance(tags, list) and len(tags) > 0:
+                        tag = tags[0].get("name")
+                        if tag:
+                            self.finished.emit(True, str(tag))
+                            return
+            except Exception:
+                pass
+
+            # 3. Fallback: scrape releases page
+            try:
+                req = urllib.request.Request(
+                    "https://github.com/bpm500/zapret_pp/releases",
+                    headers={"User-Agent": "Mozilla/5.0"}
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    html = resp.read().decode("utf-8")
+                    m = re.findall(r'/bpm500/zapret_pp/releases/tag/([^"\'\s<>]+)', html)
+                    if m:
+                        self.finished.emit(True, m[0])
+                        return
+            except Exception:
+                pass
+
+            self.finished.emit(False, "No releases found")
+        except Exception as e:
+            self.finished.emit(False, str(e))
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1943,7 +2302,25 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(APP_NAME)
         self.setFixedSize(WINDOW_W, WINDOW_H)
-        self.setStyleSheet(STYLE)
+
+        # Paths
+        self._app_dir = get_app_dir()
+        self._settings_dir = get_settings_dir(self._app_dir)
+        self._zapret_dir = self._find_zapret_dir()
+        self._cfg_file = self._settings_dir / "zapret_settings.json"
+        self._app_settings_file = self._settings_dir / "app_settings.json"
+
+        # App settings (transparency, custom colors, update check)
+        self._transparency = 100
+        self._color1 = "#0a0a0a"
+        self._color2 = "#ffffff"
+        self._text_color = "#e0e0e0"
+        self._check_update = True
+        self._load_app_settings()
+
+        self._current_stylesheet = build_stylesheet(self._color1, self._color2, self._text_color)
+        self.setStyleSheet(self._current_stylesheet)
+        self.setWindowOpacity(self._transparency / 100.0)
 
         # Window icon
         for ico_path in ("icons/ico.ico", "icons/ico.png", "ico.ico"):
@@ -1962,12 +2339,6 @@ class MainWindow(QMainWindow):
         self._create_worker: CreateWorker | None = None
         self._connect_worker: ConnectWorker | None = None
         self._dark_applied = False
-
-        # Paths
-        self._app_dir = get_app_dir()
-        self._settings_dir = get_settings_dir(self._app_dir)
-        self._zapret_dir = self._find_zapret_dir()
-        self._cfg_file = self._settings_dir / "zapret_settings.json"
 
         self._auto_connect = False
         self._auto_start = False
@@ -1998,6 +2369,9 @@ class MainWindow(QMainWindow):
 
         if self._tg_auto_connect and not self._tg_manager.is_running():
             QTimer.singleShot(500, self._tg_start_proxy_silent)
+
+        if self._check_update:
+            QTimer.singleShot(1500, self._start_startup_update_check)
 
     # ── Zapret dir detection (reworked) ───────────────────────────
 
@@ -2123,38 +2497,42 @@ class MainWindow(QMainWindow):
         vlay.setSpacing(0)
 
         # Tab bar
-        tab_bar = QWidget()
-        tab_bar.setObjectName("tabBar")
-        tab_bar.setFixedHeight(46)
-        tb = QHBoxLayout(tab_bar)
+        self._tab_bar = QWidget()
+        self._tab_bar.setObjectName("tabBar")
+        self._tab_bar.setFixedHeight(46)
+        tb = QHBoxLayout(self._tab_bar)
         tb.setContentsMargins(0, 0, 0, 0)
         tb.setSpacing(0)
 
         self._tab_connect = self._mk_tab("Connect")
         self._tab_create = self._mk_tab("Create")
-        self._tab_settings = self._mk_tab("Settings")
+        self._tab_test = self._mk_tab("Test")
         self._tab_utils = self._mk_tab("Utils")
 
         self._tab_connect.clicked.connect(lambda: self._switch(0))
         self._tab_create.clicked.connect(lambda: self._switch(1))
-        self._tab_settings.clicked.connect(lambda: self._switch(2))
+        self._tab_test.clicked.connect(lambda: self._switch(2))
         self._tab_utils.clicked.connect(lambda: self._switch(3))
 
         tb.addWidget(self._tab_connect)
         tb.addWidget(self._tab_create)
-        tb.addWidget(self._tab_settings)
+        tb.addWidget(self._tab_test)
         tb.addWidget(self._tab_utils)
-        vlay.addWidget(tab_bar)
+        vlay.addWidget(self._tab_bar)
 
         # Pages
         self._pg_connect = self._build_connect_page()
         self._pg_create = self._build_create_page()
-        self._pg_settings = self._build_settings_page()
+        self._pg_test = self._build_test_page()
         self._pg_utils = self._build_utils_page()
+        self._pg_app_settings = self._build_app_settings_page()
+        self._pg_app_settings.setVisible(False)
+
         vlay.addWidget(self._pg_connect, 1)
         vlay.addWidget(self._pg_create, 1)
-        vlay.addWidget(self._pg_settings, 1)
+        vlay.addWidget(self._pg_test, 1)
         vlay.addWidget(self._pg_utils, 1)
+        vlay.addWidget(self._pg_app_settings, 1)
 
         # Status bar
         self._status_bar = QLabel()
@@ -2173,15 +2551,31 @@ class MainWindow(QMainWindow):
         return b
 
     def _switch(self, idx: int):
+        self._pg_app_settings.setVisible(False)
+        self._tab_bar.setVisible(True)
         self._pg_connect.setVisible(idx == 0)
         self._pg_create.setVisible(idx == 1)
-        self._pg_settings.setVisible(idx == 2)
+        self._pg_test.setVisible(idx == 2)
         self._pg_utils.setVisible(idx == 3)
-        for i, b in enumerate([self._tab_connect, self._tab_create, self._tab_settings, self._tab_utils]):
+        for i, b in enumerate([self._tab_connect, self._tab_create, self._tab_test, self._tab_utils]):
             b.setProperty("active", "true" if i == idx else "false")
             b.style().unpolish(b)
             b.style().polish(b)
         self._sync_autostart_ui()
+
+    def _open_app_settings(self):
+        self._tab_bar.setVisible(False)
+        self._pg_connect.setVisible(False)
+        self._pg_create.setVisible(False)
+        self._pg_test.setVisible(False)
+        self._pg_utils.setVisible(False)
+        self._pg_app_settings.setVisible(True)
+        self._switch_app_settings(0)
+
+    def _close_app_settings(self):
+        self._pg_app_settings.setVisible(False)
+        self._tab_bar.setVisible(True)
+        self._switch(0)
 
     # ══════════════════════════════════════════════════════════════
     #  CONNECT PAGE — list left, power button right
@@ -2258,7 +2652,7 @@ class MainWindow(QMainWindow):
         opts_lay.addWidget(opt_lbl)
 
         chk_row = QHBoxLayout()
-        chk_row.setSpacing(20)
+        chk_row.setSpacing(16)
         self._chk_autostart = QCheckBox("Autostart")
         self._chk_autostart.setChecked(self._auto_start)
         self._chk_autostart.toggled.connect(self._on_autostart_changed)
@@ -2267,8 +2661,14 @@ class MainWindow(QMainWindow):
         self._chk_autoconnect.setChecked(self._auto_connect)
         self._chk_autoconnect.toggled.connect(self._on_autoconnect_changed)
 
+        self._btn_settings = QPushButton("settings")
+        self._btn_settings.setObjectName("actionBtn")
+        self._btn_settings.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_settings.clicked.connect(self._open_app_settings)
+
         chk_row.addWidget(self._chk_autostart)
         chk_row.addWidget(self._chk_autoconnect)
+        chk_row.addWidget(self._btn_settings)
         chk_row.addStretch()
         opts_lay.addLayout(chk_row)
 
@@ -2432,10 +2832,10 @@ class MainWindow(QMainWindow):
         return w
 
     # ══════════════════════════════════════════════════════════════
-    #  SETTINGS PAGE — buttons left, console right
+    #  TEST PAGE — buttons left, console right
     # ══════════════════════════════════════════════════════════════
 
-    def _build_settings_page(self) -> QWidget:
+    def _build_test_page(self) -> QWidget:
         w = QWidget()
         hlay = QHBoxLayout(w)
         hlay.setContentsMargins(0, 0, 0, 0)
@@ -2897,6 +3297,563 @@ class MainWindow(QMainWindow):
 
         return w
 
+    # ══════════════════════════════════════════════════════════════
+    #  APP SETTINGS PAGE (Fullscreen Settings Mode)
+    # ══════════════════════════════════════════════════════════════
+
+    def _build_app_settings_page(self) -> QWidget:
+        w = QWidget()
+        hlay = QHBoxLayout(w)
+        hlay.setContentsMargins(0, 0, 0, 0)
+        hlay.setSpacing(0)
+
+        # ── Left panel: Back button + vertical tabs ──
+        left = QWidget()
+        left.setObjectName("panelLeft")
+        left.setFixedWidth(180)
+        left_lay = QVBoxLayout(left)
+        left_lay.setContentsMargins(14, 14, 14, 14)
+        left_lay.setSpacing(8)
+
+        # Back button in top-left corner
+        self._btn_settings_back = QPushButton("← back")
+        self._btn_settings_back.setObjectName("actionBtn")
+        self._btn_settings_back.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_settings_back.setFixedHeight(34)
+        self._btn_settings_back.clicked.connect(self._close_app_settings)
+        left_lay.addWidget(self._btn_settings_back)
+
+        left_lay.addSpacing(12)
+
+        lbl = QLabel("SETTINGS")
+        lbl.setObjectName("sectionLbl")
+        left_lay.addWidget(lbl)
+        left_lay.addSpacing(4)
+
+        # Category tabs (vertical)
+        self._side_tab_ui = self._mk_side_tab("UI")
+        self._side_tab_update = self._mk_side_tab("Update")
+        self._side_tab_about = self._mk_side_tab("About")
+
+        self._side_tab_ui.clicked.connect(lambda: self._switch_app_settings(0))
+        self._side_tab_update.clicked.connect(lambda: self._switch_app_settings(1))
+        self._side_tab_about.clicked.connect(lambda: self._switch_app_settings(2))
+
+        left_lay.addWidget(self._side_tab_ui)
+        left_lay.addWidget(self._side_tab_update)
+        left_lay.addStretch()
+        left_lay.addWidget(self._side_tab_about)
+
+        hlay.addWidget(left)
+
+        # Divider
+        divider = QWidget()
+        divider.setObjectName("panelDivider")
+        hlay.addWidget(divider)
+
+        # ── Right panel: settings pages ──
+        right = QWidget()
+        right.setObjectName("panelRight")
+        right_lay = QVBoxLayout(right)
+        right_lay.setContentsMargins(32, 24, 32, 24)
+        right_lay.setSpacing(0)
+
+        self._subpage_ui = self._build_settings_ui_subpage()
+        self._subpage_update = self._build_settings_update_subpage()
+        self._subpage_about = self._build_settings_about_subpage()
+
+        right_lay.addWidget(self._subpage_ui, 1)
+        right_lay.addWidget(self._subpage_update, 1)
+        right_lay.addWidget(self._subpage_about, 1)
+
+        hlay.addWidget(right, 1)
+        return w
+
+    def _mk_side_tab(self, text: str) -> QPushButton:
+        b = QPushButton(text)
+        b.setObjectName("settingsSideTab")
+        b.setProperty("active", "false")
+        b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        b.setFixedHeight(38)
+        return b
+
+    def _switch_app_settings(self, idx: int):
+        self._subpage_ui.setVisible(idx == 0)
+        self._subpage_update.setVisible(idx == 1)
+        self._subpage_about.setVisible(idx == 2)
+        for i, b in enumerate([self._side_tab_ui, self._side_tab_update, self._side_tab_about]):
+            b.setProperty("active", "true" if i == idx else "false")
+            b.style().unpolish(b)
+            b.style().polish(b)
+
+    def _build_settings_ui_subpage(self) -> QWidget:
+        w = QWidget()
+        vlay = QVBoxLayout(w)
+        vlay.setContentsMargins(0, 0, 0, 0)
+        vlay.setSpacing(18)
+
+        lbl = QLabel("UI SETTINGS")
+        lbl.setObjectName("sectionLbl")
+        vlay.addWidget(lbl)
+
+        # ── 1. Transparency ──
+        trans_box = QWidget()
+        tb_lay = QVBoxLayout(trans_box)
+        tb_lay.setContentsMargins(0, 0, 0, 0)
+        tb_lay.setSpacing(6)
+
+        t_lbl = QLabel("transparency")
+        t_lbl.setStyleSheet("font-size: 13px; font-weight: 600; background: transparent;")
+        tb_lay.addWidget(t_lbl)
+
+        t_row = QHBoxLayout()
+        t_row.setSpacing(14)
+
+        self._slider_transparency = QSlider(Qt.Orientation.Horizontal)
+        self._slider_transparency.setRange(30, 100)
+        self._slider_transparency.setValue(self._transparency)
+        self._slider_transparency.setFixedHeight(22)
+        self._slider_transparency.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._slider_transparency.valueChanged.connect(self._on_slider_transparency_changed)
+
+        self._input_transparency = QLineEdit(f"{self._transparency}%")
+        self._input_transparency.setFixedWidth(64)
+        self._input_transparency.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._input_transparency.editingFinished.connect(self._on_input_transparency_changed)
+
+        t_row.addWidget(self._slider_transparency, 1)
+        t_row.addWidget(self._input_transparency)
+        tb_lay.addLayout(t_row)
+        vlay.addWidget(trans_box)
+
+        # ── 2. Color 1 ──
+        c1_box = QWidget()
+        c1_lay = QHBoxLayout(c1_box)
+        c1_lay.setContentsMargins(0, 0, 0, 0)
+        c1_lay.setSpacing(12)
+
+        c1_lbl = QLabel("Color 1")
+        c1_lbl.setStyleSheet("font-size: 13px; font-weight: 600; background: transparent; min-width: 85px;")
+
+        self._btn_color1 = QPushButton()
+        self._btn_color1.setFixedSize(36, 28)
+        self._btn_color1.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_color1.clicked.connect(self._pick_color_1)
+
+        self._lbl_hex_color1 = QLabel(self._color1.upper())
+        self._lbl_hex_color1.setStyleSheet("font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 12px; background: transparent; min-width: 75px;")
+
+        c1_desc = QLabel("Primary background color")
+        c1_desc.setObjectName("infoLbl")
+
+        c1_lay.addWidget(c1_lbl)
+        c1_lay.addWidget(self._btn_color1)
+        c1_lay.addWidget(self._lbl_hex_color1)
+        c1_lay.addWidget(c1_desc)
+        c1_lay.addStretch()
+        vlay.addWidget(c1_box)
+
+        # ── 3. Color 2 ──
+        c2_box = QWidget()
+        c2_lay = QHBoxLayout(c2_box)
+        c2_lay.setContentsMargins(0, 0, 0, 0)
+        c2_lay.setSpacing(12)
+
+        c2_lbl = QLabel("Color 2")
+        c2_lbl.setStyleSheet("font-size: 13px; font-weight: 600; background: transparent; min-width: 85px;")
+
+        self._btn_color2 = QPushButton()
+        self._btn_color2.setFixedSize(36, 28)
+        self._btn_color2.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_color2.clicked.connect(self._pick_color_2)
+
+        self._lbl_hex_color2 = QLabel(self._color2.upper())
+        self._lbl_hex_color2.setStyleSheet("font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 12px; background: transparent; min-width: 75px;")
+
+        c2_desc = QLabel("Secondary accent & highlight color")
+        c2_desc.setObjectName("infoLbl")
+
+        c2_lay.addWidget(c2_lbl)
+        c2_lay.addWidget(self._btn_color2)
+        c2_lay.addWidget(self._lbl_hex_color2)
+        c2_lay.addWidget(c2_desc)
+        c2_lay.addStretch()
+        vlay.addWidget(c2_box)
+
+        # ── 4. Text color ──
+        ct_box = QWidget()
+        ct_lay = QHBoxLayout(ct_box)
+        ct_lay.setContentsMargins(0, 0, 0, 0)
+        ct_lay.setSpacing(12)
+
+        ct_lbl = QLabel("Text color")
+        ct_lbl.setStyleSheet("font-size: 13px; font-weight: 600; background: transparent; min-width: 85px;")
+
+        self._btn_text_color = QPushButton()
+        self._btn_text_color.setFixedSize(36, 28)
+        self._btn_text_color.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_text_color.clicked.connect(self._pick_text_color)
+
+        self._lbl_hex_text_color = QLabel(self._text_color.upper())
+        self._lbl_hex_text_color.setStyleSheet("font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 12px; background: transparent; min-width: 75px;")
+
+        ct_desc = QLabel("Application text & labels color")
+        ct_desc.setObjectName("infoLbl")
+
+        ct_lay.addWidget(ct_lbl)
+        ct_lay.addWidget(self._btn_text_color)
+        ct_lay.addWidget(self._lbl_hex_text_color)
+        ct_lay.addWidget(ct_desc)
+        ct_lay.addStretch()
+        vlay.addWidget(ct_box)
+
+        vlay.addSpacing(10)
+
+        # ── Set Default ──
+        def_row = QHBoxLayout()
+        def_row.setSpacing(12)
+
+        self._btn_set_default = QPushButton("Set Default")
+        self._btn_set_default.setObjectName("actionBtn")
+        self._btn_set_default.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_set_default.setFixedWidth(120)
+        self._btn_set_default.setFixedHeight(34)
+        self._btn_set_default.clicked.connect(self._reset_ui_defaults)
+
+        def_lbl = QLabel("Restore default interface style (Minimalist B&W, 100% opacity)")
+        def_lbl.setObjectName("infoLbl")
+
+        def_row.addWidget(self._btn_set_default)
+        def_row.addWidget(def_lbl)
+        def_row.addStretch()
+        vlay.addLayout(def_row)
+
+        vlay.addStretch()
+        self._update_color_previews()
+        return w
+
+    def _build_settings_update_subpage(self) -> QWidget:
+        w = QWidget()
+        vlay = QVBoxLayout(w)
+        vlay.setContentsMargins(0, 0, 0, 0)
+        vlay.setSpacing(18)
+
+        lbl = QLabel("UPDATE SETTINGS")
+        lbl.setObjectName("sectionLbl")
+        vlay.addWidget(lbl)
+
+        # ── Check-update toggle ──
+        sw_box = QWidget()
+        sw_lay = QVBoxLayout(sw_box)
+        sw_lay.setContentsMargins(0, 0, 0, 0)
+        sw_lay.setSpacing(6)
+
+        sw_top = QHBoxLayout()
+        sw_top.setSpacing(14)
+
+        sw_title = QLabel("check-update")
+        sw_title.setStyleSheet("font-size: 13px; font-weight: 600; background: transparent; min-width: 95px;")
+
+        self._switch_check_update = ToggleSwitch(checked=self._check_update)
+        self._switch_check_update.set_colors(self._color2, self._color1)
+        self._switch_check_update.toggled.connect(self._on_check_update_toggled)
+
+        self._lbl_check_update_state = QLabel("Enabled" if self._check_update else "Disabled")
+        self._lbl_check_update_state.setStyleSheet("font-size: 12px; font-weight: 600; background: transparent;")
+
+        sw_top.addWidget(sw_title)
+        sw_top.addWidget(self._switch_check_update)
+        sw_top.addWidget(self._lbl_check_update_state)
+        sw_top.addStretch()
+        sw_lay.addLayout(sw_top)
+
+        sw_desc = QLabel("Check for new releases from https://github.com/bpm500/zapret_pp/releases on app launch.")
+        sw_desc.setObjectName("infoLbl")
+        sw_lay.addWidget(sw_desc)
+        vlay.addWidget(sw_box)
+
+        # ── Version details ──
+        info_box = QWidget()
+        ib_lay = QVBoxLayout(info_box)
+        ib_lay.setContentsMargins(0, 0, 0, 0)
+        ib_lay.setSpacing(6)
+
+        v_lbl = QLabel(f"Current version: v{APP_VERSION}")
+        v_lbl.setStyleSheet("font-size: 13px; font-weight: 600; background: transparent;")
+
+        repo_lbl = QLabel("Repository: https://github.com/bpm500/zapret_pp/releases")
+        repo_lbl.setObjectName("infoLbl")
+
+        ib_lay.addWidget(v_lbl)
+        ib_lay.addWidget(repo_lbl)
+        vlay.addWidget(info_box)
+
+        vlay.addSpacing(10)
+
+        # ── Manual check button ──
+        chk_row = QHBoxLayout()
+        chk_row.setSpacing(14)
+
+        self._btn_check_update_now = QPushButton("Check for Updates Now")
+        self._btn_check_update_now.setObjectName("actionBtn")
+        self._btn_check_update_now.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_check_update_now.setFixedHeight(34)
+        self._btn_check_update_now.clicked.connect(self._manual_check_update)
+
+        self._lbl_update_feedback = QLabel("")
+        self._lbl_update_feedback.setStyleSheet("font-size: 12px; background: transparent;")
+
+        chk_row.addWidget(self._btn_check_update_now)
+        chk_row.addWidget(self._lbl_update_feedback)
+        chk_row.addStretch()
+        vlay.addLayout(chk_row)
+
+        vlay.addStretch()
+        return w
+
+    def _build_settings_about_subpage(self) -> QWidget:
+        w = QWidget()
+        vlay = QVBoxLayout(w)
+        vlay.setContentsMargins(32, 24, 32, 24)
+        vlay.setSpacing(8)
+
+        vlay.addStretch(1)
+
+        self._lbl_about_author = QLabel("author @bpm500")
+        self._lbl_about_author.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl_about_author.setStyleSheet("font-size: 15px; font-weight: 600; background: transparent;")
+        self._lbl_about_author.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+        self._lbl_about_github = QLabel(
+            f'github: <a href="https://github.com/bpm500/zapret_pp" style="color: {self._text_color}; text-decoration: underline;">https://github.com/bpm500/zapret_pp</a>'
+        )
+        self._lbl_about_github.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl_about_github.setOpenExternalLinks(True)
+        self._lbl_about_github.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._lbl_about_github.setStyleSheet("font-size: 13px; background: transparent;")
+        self._lbl_about_github.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.LinksAccessibleByMouse
+        )
+
+        vlay.addWidget(self._lbl_about_author)
+        vlay.addWidget(self._lbl_about_github)
+
+        vlay.addStretch(1)
+        return w
+
+    def _on_slider_transparency_changed(self, val: int):
+        self._transparency = val
+        self._input_transparency.blockSignals(True)
+        self._input_transparency.setText(f"{val}%")
+        self._input_transparency.blockSignals(False)
+        self.setWindowOpacity(val / 100.0)
+        self._save_app_settings()
+
+    def _on_input_transparency_changed(self):
+        text = self._input_transparency.text()
+        nums = re.findall(r"\d+", text)
+        if nums:
+            val = max(30, min(100, int(nums[0])))
+            self._transparency = val
+            self._slider_transparency.blockSignals(True)
+            self._slider_transparency.setValue(val)
+            self._slider_transparency.blockSignals(False)
+            self._input_transparency.setText(f"{val}%")
+            self.setWindowOpacity(val / 100.0)
+            self._save_app_settings()
+        else:
+            self._input_transparency.setText(f"{self._transparency}%")
+
+    def _pick_color_dialog(self, initial_hex: str, title: str) -> str | None:
+        dlg = QColorDialog(QColor(initial_hex), self)
+        dlg.setWindowTitle(title)
+        dlg.setStyleSheet(self._current_stylesheet)
+        try:
+            apply_dark_titlebar(int(dlg.winId()), _is_dark_color(self._color1))
+        except Exception:
+            pass
+        if dlg.exec():
+            c = dlg.selectedColor()
+            if not c.isValid():
+                c = dlg.currentColor()
+            if c.isValid():
+                return c.name().lower()
+        return None
+
+    def _pick_color_1(self):
+        c = self._pick_color_dialog(self._color1, "Select Color 1 (Background)")
+        if c:
+            self._color1 = c
+            self._update_color_previews()
+            self._apply_theme()
+            self._save_app_settings()
+
+    def _pick_color_2(self):
+        c = self._pick_color_dialog(self._color2, "Select Color 2 (Accent)")
+        if c:
+            self._color2 = c
+            self._update_color_previews()
+            self._apply_theme()
+            self._save_app_settings()
+
+    def _pick_text_color(self):
+        c = self._pick_color_dialog(self._text_color, "Select Text Color")
+        if c:
+            self._text_color = c
+            self._update_color_previews()
+            self._apply_theme()
+            self._save_app_settings()
+
+    def _reset_ui_defaults(self):
+        self._transparency = 100
+        self._color1 = "#0a0a0a"
+        self._color2 = "#ffffff"
+        self._text_color = "#e0e0e0"
+
+        if hasattr(self, "_slider_transparency"):
+            self._slider_transparency.blockSignals(True)
+            self._slider_transparency.setValue(100)
+            self._slider_transparency.blockSignals(False)
+        if hasattr(self, "_input_transparency"):
+            self._input_transparency.blockSignals(True)
+            self._input_transparency.setText("100%")
+            self._input_transparency.blockSignals(False)
+
+        self.setWindowOpacity(1.0)
+        self._update_color_previews()
+        self._apply_theme()
+        self._save_app_settings()
+
+    def _update_color_previews(self):
+        if not hasattr(self, "_btn_color1"):
+            return
+        b1 = "#ffffff" if _is_dark_color(self._color1) else "#000000"
+        b2 = "#ffffff" if _is_dark_color(self._color2) else "#000000"
+        bt = "#ffffff" if _is_dark_color(self._text_color) else "#000000"
+
+        self._btn_color1.setStyleSheet(
+            f"QPushButton {{ background-color: {self._color1}; border: 2px solid {b1}; border-radius: 4px; }}"
+            f"QPushButton:hover {{ border-color: {self._color2}; }}"
+        )
+        self._lbl_hex_color1.setText(self._color1.upper())
+
+        self._btn_color2.setStyleSheet(
+            f"QPushButton {{ background-color: {self._color2}; border: 2px solid {b2}; border-radius: 4px; }}"
+            f"QPushButton:hover {{ border-color: {self._color2}; }}"
+        )
+        self._lbl_hex_color2.setText(self._color2.upper())
+
+        self._btn_text_color.setStyleSheet(
+            f"QPushButton {{ background-color: {self._text_color}; border: 2px solid {bt}; border-radius: 4px; }}"
+            f"QPushButton:hover {{ border-color: {self._color2}; }}"
+        )
+        self._lbl_hex_text_color.setText(self._text_color.upper())
+
+    def _apply_theme(self):
+        self._current_stylesheet = build_stylesheet(self._color1, self._color2, self._text_color)
+        self.setStyleSheet(self._current_stylesheet)
+        self.setWindowOpacity(self._transparency / 100.0)
+        self._update_color_previews()
+        if hasattr(self, "_switch_check_update"):
+            self._switch_check_update.set_colors(self._color2, self._color1)
+        if hasattr(self, "_power_btn") and hasattr(self._power_btn, "set_theme"):
+            self._power_btn.set_theme(self._color1, self._color2)
+        if hasattr(self, "_lbl_about_github"):
+            self._lbl_about_github.setText(
+                f'github: <a href="https://github.com/bpm500/zapret_pp" style="color: {self._text_color}; text-decoration: underline;">https://github.com/bpm500/zapret_pp</a>'
+            )
+        if hasattr(self, "_refresh_statusbar"):
+            self._refresh_statusbar()
+        if hasattr(self, "_status_lbl"):
+            self._sync_ui()
+        try:
+            apply_dark_titlebar(int(self.winId()), _is_dark_color(self._color1))
+        except Exception:
+            pass
+
+    def _on_check_update_toggled(self, checked: bool):
+        self._check_update = checked
+        if hasattr(self, "_lbl_check_update_state"):
+            self._lbl_check_update_state.setText("Enabled" if checked else "Disabled")
+        self._save_app_settings()
+
+    def _manual_check_update(self):
+        self._btn_check_update_now.setEnabled(False)
+        self._lbl_update_feedback.setText("Checking GitHub...")
+        self._lbl_update_feedback.setStyleSheet("color: #888888; font-size: 12px; background: transparent;")
+        self._manual_worker = UpdateCheckWorker(self)
+        self._manual_worker.finished.connect(self._on_manual_check_finished)
+        self._manual_worker.start()
+
+    def _on_manual_check_finished(self, success: bool, tag: str):
+        self._btn_check_update_now.setEnabled(True)
+        if success and tag:
+            if is_newer_version(tag, APP_VERSION):
+                self._lbl_update_feedback.setText(f"New update found: {tag}")
+                self._lbl_update_feedback.setStyleSheet("color: #4cd964; font-size: 12px; background: transparent;")
+                self._show_update_dialog(tag)
+            else:
+                self._lbl_update_feedback.setText(f"You have the latest version (v{APP_VERSION}).")
+                self._lbl_update_feedback.setStyleSheet("color: #888888; font-size: 12px; background: transparent;")
+        else:
+            self._lbl_update_feedback.setText("Check failed (no connection or rate limit).")
+            self._lbl_update_feedback.setStyleSheet("color: #ff6666; font-size: 12px; background: transparent;")
+
+    def _start_startup_update_check(self):
+        if not self._check_update:
+            return
+        self._startup_worker = UpdateCheckWorker(self)
+        self._startup_worker.finished.connect(self._on_startup_check_finished)
+        self._startup_worker.start()
+
+    def _on_startup_check_finished(self, success: bool, tag: str):
+        if success and tag and is_newer_version(tag, APP_VERSION):
+            self._show_update_dialog(tag)
+
+    def _show_update_dialog(self, new_tag: str):
+        dlg = NewUpdateDialog(new_tag, APP_VERSION, self._current_stylesheet, self)
+        dlg.exec()
+
+    def _load_app_settings(self):
+        self._app_settings_file = self._settings_dir / "app_settings.json"
+        self._transparency = 100
+        self._color1 = "#0a0a0a"
+        self._color2 = "#ffffff"
+        self._text_color = "#e0e0e0"
+        self._check_update = True
+
+        if self._app_settings_file.exists():
+            try:
+                data = json.loads(self._app_settings_file.read_text(encoding="utf-8"))
+                self._transparency = max(30, min(100, int(data.get("transparency", 100))))
+                self._color1 = str(data.get("color1", "#0a0a0a")).strip().lower()
+                self._color2 = str(data.get("color2", "#ffffff")).strip().lower()
+                self._text_color = str(data.get("text_color", "#e0e0e0")).strip().lower()
+                self._check_update = bool(data.get("check_update", True))
+            except Exception:
+                pass
+        else:
+            self._save_app_settings()
+
+    def _save_app_settings(self):
+        if not hasattr(self, "_app_settings_file"):
+            self._app_settings_file = self._settings_dir / "app_settings.json"
+        data = {
+            "transparency": self._transparency,
+            "color1": self._color1,
+            "color2": self._color2,
+            "text_color": self._text_color,
+            "check_update": self._check_update,
+        }
+        try:
+            self._app_settings_file.parent.mkdir(parents=True, exist_ok=True)
+            self._app_settings_file.write_text(
+                json.dumps(data, indent=2, ensure_ascii=False),
+                encoding="utf-8"
+            )
+        except Exception:
+            pass
+
     # ── TG WS Proxy Logic ─────────────────────────────────────────
 
     def _tg_populate_form(self, cfg: dict):
@@ -3169,7 +4126,7 @@ class MainWindow(QMainWindow):
         self._tray.activated.connect(self._on_tray_activated)
 
         m = QMenu()
-        m.setStyleSheet(STYLE)
+        m.setStyleSheet(self._current_stylesheet)
         self._act_open = QAction("Open", self)
         self._act_conn = QAction("Connect", self)
         self._act_disc = QAction("Disconnect", self)
@@ -3239,7 +4196,7 @@ class MainWindow(QMainWindow):
         if not self._dark_applied:
             self._dark_applied = True
             try:
-                apply_dark_titlebar(int(self.winId()))
+                apply_dark_titlebar(int(self.winId()), _is_dark_color(self._color1))
             except Exception:
                 pass
 
@@ -3345,7 +4302,7 @@ class MainWindow(QMainWindow):
                 fname = fname[len(m):]
 
         menu = QMenu(self)
-        menu.setStyleSheet(STYLE)
+        menu.setStyleSheet(self._current_stylesheet)
         clean_name = fname.replace(".bat", "")
         delete_action = QAction(f'Delete "{clean_name}"', self)
         delete_action.triggered.connect(lambda: self._delete_config(fname))
@@ -3427,9 +4384,11 @@ class MainWindow(QMainWindow):
         self._log("Disconnected.", "dim")
 
     def _sync_ui(self):
+        c_conn = self._color2 if hasattr(self, "_color2") else "#ffffff"
+        c_disc = _blend_color(self._text_color, self._color1, 0.45) if hasattr(self, "_text_color") and hasattr(self, "_color1") else "#777777"
         self._set_status(
             "Connected" if self._connected else "Disconnected",
-            "#e0e0e0" if self._connected else "#777"
+            c_conn if self._connected else c_disc
         )
         self._refresh_tray()
         self._refresh_statusbar()
@@ -3443,13 +4402,23 @@ class MainWindow(QMainWindow):
     def _refresh_statusbar(self):
         dot = "●" if self._connected else "○"
         state = "Connected" if self._connected else "Disconnected"
-        col = "#888" if self._connected else "#333"
         admin = "Admin ✓" if is_admin() else "No admin"
         self._status_bar.setText(f"  {dot} {state}   ·   {admin}   ·   {APP_NAME} v{APP_VERSION}   ·   @bpm500")
-        self._status_bar.setStyleSheet(
-            f"background: #060606; color: {col}; font-size: 11px; "
-            f"border-top: 1px solid #111; padding: 0 14px;"
-        )
+        if hasattr(self, "_color1") and hasattr(self, "_text_color"):
+            dark = _is_dark_color(self._color1)
+            bg_bar = _blend_color(self._color1, "#000000" if dark else "#ffffff", 0.04)
+            border_bar = _blend_color(self._color1, "#ffffff" if dark else "#000000", 0.12)
+            txt_bar = _blend_color(self._text_color, self._color1, 0.35 if self._connected else 0.65)
+            self._status_bar.setStyleSheet(
+                f"background: {bg_bar}; color: {txt_bar}; font-size: 11px; "
+                f"border-top: 1px solid {border_bar}; padding: 0 14px;"
+            )
+        else:
+            col = "#888" if self._connected else "#333"
+            self._status_bar.setStyleSheet(
+                f"background: #060606; color: {col}; font-size: 11px; "
+                f"border-top: 1px solid #111; padding: 0 14px;"
+            )
 
     # ── Settings actions ──────────────────────────────────────────
 
