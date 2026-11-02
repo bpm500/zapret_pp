@@ -17,6 +17,7 @@ import threading
 import time
 import winreg
 from pathlib import Path
+import shutil
 import urllib.request
 from urllib.parse import urlparse
 
@@ -31,6 +32,7 @@ from PyQt6.QtGui import (
     QFont,
     QIcon,
     QImage,
+    QMovie,
     QPainter,
     QPalette,
     QPen,
@@ -41,6 +43,7 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QColorDialog,
     QDialog,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -48,6 +51,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMenu,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -58,6 +62,12 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+try:
+    from PyQt6.QtMultimedia import QMediaPlayer, QVideoFrame, QVideoSink
+    HAS_MULTIMEDIA = True
+except Exception:
+    HAS_MULTIMEDIA = False
 from autostart import (
     disable_autostart,
     enable_autostart,
@@ -78,7 +88,7 @@ from tg_proxy_service import (
 # ══════════════════════════════════════════════════════════════════
 
 APP_NAME = "zapret++"
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 WINDOW_W, WINDOW_H = 800, 600  # 4:3
 
 # ══════════════════════════════════════════════════════════════════
@@ -592,7 +602,7 @@ def _is_dark_color(h: str) -> bool:
     return (0.299 * r + 0.587 * g + 0.114 * b) < 128
 
 
-def build_stylesheet(color1: str = "#0a0a0a", color2: str = "#ffffff", text_color: str = "#e0e0e0") -> str:
+def build_stylesheet(color1: str = "#0a0a0a", color2: str = "#ffffff", text_color: str = "#e0e0e0", has_wallpaper: bool = False) -> str:
     dark_theme = _is_dark_color(color1)
     contrast_partner = "#ffffff" if dark_theme else "#000000"
 
@@ -617,15 +627,59 @@ def build_stylesheet(color1: str = "#0a0a0a", color2: str = "#ffffff", text_colo
     txt_muted = _blend_color(text_color, color1, 0.55)
     txt_disabled = _blend_color(text_color, color1, 0.70)
 
+    if has_wallpaper:
+        r1, g1, b1 = _hex_to_rgb(color1)
+        bg_panel_left = f"rgba({r1}, {g1}, {b1}, 0.82)"
+        bg_panel_right = f"rgba({r1}, {g1}, {b1}, 0.65)"
+        bg_tab_bar = f"rgba({r1}, {g1}, {b1}, 0.88)"
+        bg_card = f"rgba({r1}, {g1}, {b1}, 0.80)"
+        bg_hover = f"rgba({r1}, {g1}, {b1}, 0.90)"
+        bg_pressed = f"rgba({r1}, {g1}, {b1}, 0.70)"
+        bg_input = f"rgba({r1}, {g1}, {b1}, 0.85)"
+        bg_darker = f"rgba({r1}, {g1}, {b1}, 0.80)"
+        panel_rules = f"""
+QMainWindow {{
+    background: transparent;
+}}
+QWidget {{
+    background: transparent;
+    color: {txt_primary};
+}}
+QWidget#panelLeft {{
+    background: {bg_panel_left};
+}}
+QWidget#panelRight {{
+    background: {bg_panel_right};
+}}
+QWidget#tabBar {{
+    background: {bg_tab_bar};
+    border-bottom: 1px solid {border_dark};
+}}
+"""
+    else:
+        panel_rules = f"""
+QMainWindow, QWidget {{
+    background: {bg_main};
+    color: {txt_primary};
+}}
+QWidget#panelLeft {{
+    background: {bg_panel_left};
+}}
+QWidget#panelRight {{
+    background: {bg_main};
+}}
+QWidget#tabBar {{
+    background: {bg_tab_bar};
+    border-bottom: 1px solid {border_dark};
+}}
+"""
+
     return f"""
 * {{
     font-family: 'Segoe UI', sans-serif;
 }}
 
-QMainWindow, QWidget {{
-    background: {bg_main};
-    color: {txt_primary};
-}}
+{panel_rules}
 
 QDialog {{
     background: {bg_main};
@@ -635,22 +689,10 @@ QDialog {{
 }}
 
 /* ── Panels ── */
-QWidget#panelLeft {{
-    background: {bg_panel_left};
-}}
-QWidget#panelRight {{
-    background: {bg_main};
-}}
 QWidget#panelDivider {{
     background: {border_dark};
     min-width: 1px;
     max-width: 1px;
-}}
-
-/* ── Tab bar ── */
-QWidget#tabBar {{
-    background: {bg_tab_bar};
-    border-bottom: 1px solid {border_dark};
 }}
 QPushButton#tab {{
     background: transparent;
@@ -1006,6 +1048,21 @@ QSlider::add-page:horizontal {{
     border-radius: 2px;
 }}
 
+/* ── Progress Bar ── */
+QProgressBar {{
+    background: {bg_input};
+    border: 1px solid {border_dark};
+    border-radius: 4px;
+    text-align: center;
+    color: {txt_primary};
+    font-size: 11px;
+    height: 14px;
+}}
+QProgressBar::chunk {{
+    background: {accent};
+    border-radius: 3px;
+}}
+
 /* ── Color Dialog ── */
 QColorDialog {{
     background: {bg_main};
@@ -1067,6 +1124,148 @@ QColorDialog QDialogButtonBox QPushButton:default:hover {{
 
 
 STYLE = build_stylesheet("#0a0a0a", "#ffffff", "#e0e0e0")
+
+# ══════════════════════════════════════════════════════════════════
+#  WALLPAPER WIDGET (Image / GIF / Video background)
+# ══════════════════════════════════════════════════════════════════
+
+class WallpaperWidget(QWidget):
+    """
+    Background widget supporting images, animated GIFs, and videos (without sound).
+    Smoothly scales and centers media preserving aspect ratio (no squishing/stretching).
+    """
+    def __init__(self, parent: QWidget | None = None, color1: str = "#0a0a0a"):
+        super().__init__(parent)
+        self._color1 = color1
+        self._current_pixmap: QPixmap | None = None
+        self._wallpaper_path: Path | None = None
+        self._movie: QMovie | None = None
+        self._player: "QMediaPlayer | None" = None
+        self._sink: "QVideoSink | None" = None
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAutoFillBackground(False)
+
+    def set_base_color(self, color: str):
+        self._color1 = color
+        self.update()
+
+    def clear_wallpaper(self):
+        if self._movie:
+            try:
+                self._movie.stop()
+                self._movie.deleteLater()
+            except Exception:
+                pass
+            self._movie = None
+
+        if self._player:
+            try:
+                self._player.stop()
+                self._player.setSource(QUrl())
+            except Exception:
+                pass
+
+        self._current_pixmap = None
+        self._wallpaper_path = None
+        self.update()
+
+    def set_wallpaper(self, path: Path | str | None):
+        self.clear_wallpaper()
+        if not path:
+            return
+
+        p = Path(path)
+        if not p.exists():
+            return
+
+        self._wallpaper_path = p
+        ext = p.suffix.lower()
+
+        # 1. Animated GIF
+        if ext == ".gif":
+            try:
+                self._movie = QMovie(str(p))
+                self._movie.frameChanged.connect(self._on_movie_frame)
+                self._movie.start()
+                self._current_pixmap = self._movie.currentPixmap()
+                self.update()
+                return
+            except Exception:
+                pass
+
+        # 2. Video formats (no sound)
+        video_exts = (".mp4", ".mkv", ".avi", ".webm", ".mov", ".wmv", ".flv", ".m4v")
+        if ext in video_exts and HAS_MULTIMEDIA:
+            try:
+                if self._player is None:
+                    self._player = QMediaPlayer(self)
+                    self._sink = QVideoSink(self)
+                    self._player.setVideoSink(self._sink)
+                    self._player.setAudioOutput(None)
+                    self._sink.videoFrameChanged.connect(self._on_video_frame)
+
+                self._player.setLoops(QMediaPlayer.Loops.Infinite)
+                self._player.setSource(QUrl.fromLocalFile(str(p)))
+                self._player.play()
+                return
+            except Exception:
+                pass
+
+        # 3. Static image (PNG, JPG, BMP, WEBP, etc.)
+        try:
+            pm = QPixmap(str(p))
+            if not pm.isNull():
+                self._current_pixmap = pm
+                self.update()
+                return
+        except Exception:
+            pass
+
+        # Fallback to multimedia if available
+        if HAS_MULTIMEDIA and self._player is None:
+            try:
+                self._player = QMediaPlayer(self)
+                self._sink = QVideoSink(self)
+                self._player.setVideoSink(self._sink)
+                self._player.setAudioOutput(None)
+                self._sink.videoFrameChanged.connect(self._on_video_frame)
+                self._player.setLoops(QMediaPlayer.Loops.Infinite)
+                self._player.setSource(QUrl.fromLocalFile(str(p)))
+                self._player.play()
+            except Exception:
+                pass
+
+    def _on_movie_frame(self):
+        if self._movie:
+            pm = self._movie.currentPixmap()
+            if not pm.isNull():
+                self._current_pixmap = pm
+                self.update()
+
+    def _on_video_frame(self, frame: "QVideoFrame"):
+        img = frame.toImage()
+        if not img.isNull():
+            self._current_pixmap = QPixmap.fromImage(img)
+            self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+
+        w, h = self.width(), self.height()
+        if self._current_pixmap and not self._current_pixmap.isNull() and w > 0 and h > 0:
+            scaled = self._current_pixmap.scaled(
+                w, h,
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            x = (w - scaled.width()) // 2
+            y = (h - scaled.height()) // 2
+            painter.drawPixmap(x, y, scaled)
+        else:
+            painter.fillRect(self.rect(), QColor(self._color1))
+
 
 # ══════════════════════════════════════════════════════════════════
 #  POWER BUTTON (3 states: off / pending / on)
@@ -1229,17 +1428,99 @@ def is_newer_version(remote: str, local: str) -> bool:
     return parse_version(remote) > parse_version(local)
 
 
+def get_target_exe() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve()
+    app_dir = Path(__file__).resolve().parent
+    exe_candidate = app_dir / "dist" / "zapret_pp.exe"
+    if exe_candidate.exists():
+        return exe_candidate
+    exe_root = app_dir / "zapret_pp.exe"
+    if exe_root.exists():
+        return exe_root
+    return exe_candidate
+
+
+class AutoUpdateWorker(QThread):
+    progress = pyqtSignal(int, int)  # downloaded_bytes, total_bytes
+    status = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, download_url: str, target_exe: Path):
+        super().__init__()
+        self.download_url = download_url
+        self.target_exe = target_exe
+
+    def run(self):
+        try:
+            self.status.emit("Connecting to server...")
+            req = urllib.request.Request(
+                self.download_url,
+                headers={"User-Agent": "zapret_pp"}
+            )
+            temp_dir = Path(os.environ.get("TEMP", str(self.target_exe.parent)))
+            temp_exe = temp_dir / f"zapret_pp_update_{os.getpid()}.exe"
+
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                total_size = int(resp.headers.get("Content-Length", 0))
+                downloaded = 0
+                chunk_size = 65536
+
+                with open(temp_exe, "wb") as f:
+                    while True:
+                        chunk = resp.read(chunk_size)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        self.progress.emit(downloaded, total_size)
+
+            if not temp_exe.exists() or temp_exe.stat().st_size < 10000:
+                self.finished.emit(False, "Downloaded file is corrupted or too small.")
+                return
+
+            self.status.emit("Applying update and restarting...")
+            updater_bat = temp_dir / f"zapret_pp_updater_{os.getpid()}.bat"
+            bat_script = f"""@echo off
+chcp 65001 > nul
+timeout /t 1 /nobreak > nul
+taskkill /f /pid {os.getpid()} > nul 2>&1
+:loop
+del "{self.target_exe}" > nul 2>&1
+if exist "{self.target_exe}" (
+    timeout /t 1 /nobreak > nul
+    goto loop
+)
+move /y "{temp_exe}" "{self.target_exe}" > nul
+start "" "{self.target_exe}"
+del "%~f0"
+"""
+            updater_bat.write_text(bat_script, encoding="utf-8")
+
+            subprocess.Popen(
+                ["cmd.exe", "/c", str(updater_bat)],
+                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+                close_fds=True
+            )
+            self.finished.emit(True, "")
+        except Exception as e:
+            self.finished.emit(False, str(e))
+
+
 class NewUpdateDialog(QDialog):
-    def __init__(self, new_tag: str, current_ver: str, stylesheet: str, parent=None):
+    def __init__(self, new_tag: str, current_ver: str, stylesheet: str, parent=None, auto_download: bool = False, download_url: str = ""):
         super().__init__(parent)
         self.setWindowTitle("New update")
-        self.setFixedSize(380, 200)
+        self.setFixedSize(400, 230 if auto_download else 200)
         self.setModal(True)
         self.setStyleSheet(stylesheet)
+        self.auto_download = auto_download
+        self.download_url = download_url or f"https://github.com/bpm500/zapret_pp/releases/download/{new_tag}/zapret_pp.exe"
+        self._update_worker: AutoUpdateWorker | None = None
 
         vlay = QVBoxLayout(self)
-        vlay.setContentsMargins(28, 24, 28, 24)
-        vlay.setSpacing(14)
+        vlay.setContentsMargins(28, 22, 28, 22)
+        vlay.setSpacing(12)
 
         lbl_title = QLabel("New update")
         lbl_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1251,34 +1532,102 @@ class NewUpdateDialog(QDialog):
         lbl_info.setStyleSheet("font-size: 13px; color: #888888; background: transparent;")
         vlay.addWidget(lbl_info)
 
+        # Progress bar and status label for auto-download
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setFixedHeight(14)
+        self._progress_bar.setVisible(False)
+        vlay.addWidget(self._progress_bar)
+
+        self._lbl_status = QLabel("")
+        self._lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl_status.setStyleSheet("font-size: 11px; color: #888888; background: transparent;")
+        self._lbl_status.setVisible(False)
+        vlay.addWidget(self._lbl_status)
+
         vlay.addStretch()
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(14)
 
-        self._btn_back = QPushButton("back")
-        self._btn_back.setObjectName("actionBtn")
-        self._btn_back.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self._btn_back.setFixedHeight(36)
-        self._btn_back.clicked.connect(self.reject)
+        if self.auto_download:
+            self._btn_cancel = QPushButton("cancel")
+            self._btn_cancel.setObjectName("actionBtn")
+            self._btn_cancel.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            self._btn_cancel.setFixedHeight(36)
+            self._btn_cancel.clicked.connect(self.reject)
 
-        self._btn_download = QPushButton("download")
-        self._btn_download.setObjectName("createBtn")
-        self._btn_download.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self._btn_download.setFixedHeight(36)
-        self._btn_download.clicked.connect(self._download)
+            self._btn_install_auto = QPushButton("install auto")
+            self._btn_install_auto.setObjectName("createBtn")
+            self._btn_install_auto.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            self._btn_install_auto.setFixedHeight(36)
+            self._btn_install_auto.clicked.connect(self._install_auto)
 
-        btn_row.addWidget(self._btn_back)
-        btn_row.addWidget(self._btn_download)
+            btn_row.addWidget(self._btn_cancel)
+            btn_row.addWidget(self._btn_install_auto)
+        else:
+            self._btn_back = QPushButton("back")
+            self._btn_back.setObjectName("actionBtn")
+            self._btn_back.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            self._btn_back.setFixedHeight(36)
+            self._btn_back.clicked.connect(self.reject)
+
+            self._btn_download = QPushButton("download")
+            self._btn_download.setObjectName("createBtn")
+            self._btn_download.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            self._btn_download.setFixedHeight(36)
+            self._btn_download.clicked.connect(self._download)
+
+            btn_row.addWidget(self._btn_back)
+            btn_row.addWidget(self._btn_download)
+
         vlay.addLayout(btn_row)
 
     def _download(self):
         QDesktopServices.openUrl(QUrl("https://github.com/bpm500/zapret_pp/releases"))
         self.accept()
 
+    def _install_auto(self):
+        self._btn_cancel.setEnabled(False)
+        self._btn_install_auto.setEnabled(False)
+        self._progress_bar.setVisible(True)
+        self._lbl_status.setVisible(True)
+        self._lbl_status.setText("Connecting...")
+
+        target_exe = get_target_exe()
+        self._update_worker = AutoUpdateWorker(self.download_url, target_exe)
+        self._update_worker.progress.connect(self._on_download_progress)
+        self._update_worker.status.connect(self._lbl_status.setText)
+        self._update_worker.finished.connect(self._on_update_finished)
+        self._update_worker.start()
+
+    def _on_download_progress(self, downloaded: int, total: int):
+        if total > 0:
+            pct = int((downloaded / total) * 100)
+            mb_down = downloaded / (1024 * 1024)
+            mb_tot = total / (1024 * 1024)
+            self._progress_bar.setValue(pct)
+            self._lbl_status.setText(f"Downloading: {mb_down:.1f} / {mb_tot:.1f} MB ({pct}%)")
+        else:
+            mb_down = downloaded / (1024 * 1024)
+            self._lbl_status.setText(f"Downloading: {mb_down:.1f} MB")
+
+    def _on_update_finished(self, success: bool, err_msg: str):
+        if success:
+            self._lbl_status.setText("Update installed! Restarting...")
+            self._lbl_status.setStyleSheet("color: #4cd964; font-size: 11px; background: transparent;")
+            QTimer.singleShot(700, QApplication.quit)
+        else:
+            self._lbl_status.setText(f"Failed: {err_msg}")
+            self._lbl_status.setStyleSheet("color: #ff5555; font-size: 11px; background: transparent;")
+            self._btn_cancel.setEnabled(True)
+            self._btn_install_auto.setEnabled(True)
+            self._btn_install_auto.setText("retry")
+
 
 class UpdateCheckWorker(QThread):
-    finished = pyqtSignal(bool, str)
+    finished = pyqtSignal(bool, str, str)  # success, tag, download_url
 
     def run(self):
         try:
@@ -1292,7 +1641,15 @@ class UpdateCheckWorker(QThread):
                     data = json.loads(resp.read().decode("utf-8"))
                     tag = data.get("tag_name")
                     if tag:
-                        self.finished.emit(True, str(tag))
+                        asset_url = ""
+                        for a in data.get("assets", []):
+                            n = a.get("name", "").lower()
+                            if n.endswith(".exe"):
+                                asset_url = a.get("browser_download_url", "")
+                                break
+                        if not asset_url:
+                            asset_url = f"https://github.com/bpm500/zapret_pp/releases/download/{tag}/zapret_pp.exe"
+                        self.finished.emit(True, str(tag), asset_url)
                         return
             except Exception:
                 pass
@@ -1308,7 +1665,8 @@ class UpdateCheckWorker(QThread):
                     if tags and isinstance(tags, list) and len(tags) > 0:
                         tag = tags[0].get("name")
                         if tag:
-                            self.finished.emit(True, str(tag))
+                            asset_url = f"https://github.com/bpm500/zapret_pp/releases/download/{tag}/zapret_pp.exe"
+                            self.finished.emit(True, str(tag), asset_url)
                             return
             except Exception:
                 pass
@@ -1323,14 +1681,16 @@ class UpdateCheckWorker(QThread):
                     html = resp.read().decode("utf-8")
                     m = re.findall(r'/bpm500/zapret_pp/releases/tag/([^"\'\s<>]+)', html)
                     if m:
-                        self.finished.emit(True, m[0])
+                        tag = m[0]
+                        asset_url = f"https://github.com/bpm500/zapret_pp/releases/download/{tag}/zapret_pp.exe"
+                        self.finished.emit(True, tag, asset_url)
                         return
             except Exception:
                 pass
 
-            self.finished.emit(False, "No releases found")
+            self.finished.emit(False, "No releases found", "")
         except Exception as e:
-            self.finished.emit(False, str(e))
+            self.finished.emit(False, str(e), "")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1450,7 +1810,7 @@ class TestWorker(QThread):
     ranked = pyqtSignal(str)
     finished = pyqtSignal()
 
-    def __init__(self, bat_files: list, zapret_dir: Path, was_connected: bool = False, multi_ping: bool = False):
+    def __init__(self, bat_files: list, zapret_dir: Path, was_connected: bool = False, multi_ping: bool = True):
         super().__init__()
         self.bat_files = list(bat_files)
         self.zapret_dir = zapret_dir
@@ -1665,6 +2025,41 @@ class TestWorker(QThread):
 
         self.ranked.emit(json.dumps({"sorted": sorted_bat_files, "ranks": ranked_dict}))
         self.finished.emit()
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SOUNDCLOUD DOMAINS FOR HOSTLIST
+# ══════════════════════════════════════════════════════════════════
+
+SOUNDCLOUD_DOMAINS = [
+    "soundcloud.com",
+    "api.soundcloud.com",
+    "feeds.soundcloud.com",
+    "media.soundcloud.com",
+    "cf-media.sndcdn.com",
+    "edge-api.soundcloud.com",
+    "w1.sndcdn.com",
+    "api-v2.soundcloud.com",
+    "assets.soundcloud.com",
+    "secure-media.soundcloud.com",
+    "cf-hls-media.sndcdn.com",
+    "sndcdn.com",
+    "mobi.soundcloud.com",
+    "promote-v2.soundcloud.com",
+    "charts.soundcloud.com",
+    "developers.soundcloud.com",
+    "checkout.soundcloud.com",
+    "pre-pnd.soundcloud.com",
+    "pnd.soundcloud.com",
+    "help.soundcloud.com",
+    "support.soundcloud.com",
+    "a-v2.sndcdn.com",
+    "style.sndcdn.com",
+    "assets.web.soundcloud.cloud",
+    "i1.sndcdn.com",
+    "al.sndcdn.com",
+    "playback.media-streaming.soundcloud.cloud",
+]
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1913,6 +2308,316 @@ STRATEGIES = [
         '--dpi-desync-fake-tls="{bin}tls_clienthello_www_google_com.bin" '
         '--dpi-desync-split-seqovl-pattern="{bin}tls_clienthello_4pda_to.bin"'
     )),
+
+    # ── hostfakesplit variants (ALT3/ALT4/EXP bypasses) ──
+    ("hostfakesplit-ts-google", (
+        '--dpi-desync=hostfakesplit --dpi-desync-fooling=ts '
+        '--dpi-desync-hostfakesplit-mod=host=www.google.com'
+    )),
+    ("hostfakesplit-ts-altorder", (
+        '--dpi-desync=hostfakesplit --dpi-desync-fooling=ts '
+        '--dpi-desync-hostfakesplit-mod=host=www.google.com,altorder=1'
+    )),
+    ("fake-hostfakesplit-rnd-google-ts", (
+        '--dpi-desync=fake,hostfakesplit '
+        '--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com '
+        '--dpi-desync-hostfakesplit-mod=host=www.google.com,altorder=1 '
+        '--dpi-desync-fooling=ts'
+    )),
+    ("fake-hostfakesplit-rnd-yaru-ts", (
+        '--dpi-desync=fake,hostfakesplit '
+        '--dpi-desync-fake-tls-mod=rnd,dupsid,sni=ya.ru '
+        '--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1 '
+        '--dpi-desync-fooling=ts'
+    )),
+    ("fake-hostfakesplit-badseq-r8", (
+        '--dpi-desync=fake,hostfakesplit '
+        '--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com '
+        '--dpi-desync-hostfakesplit-mod=host=www.google.com,altorder=1 '
+        '--dpi-desync-fooling=badseq'
+    )),
+    ("fake-hostfakesplit-4pda-ts", (
+        '--dpi-desync=fake,hostfakesplit '
+        '--dpi-desync-fake-tls-mod=rnd,dupsid,sni=4pda.to '
+        '--dpi-desync-hostfakesplit-mod=host=4pda.to,altorder=1 '
+        '--dpi-desync-fooling=ts'
+    )),
+
+    # ── fakedsni variants (SNI-targeting DPI desync) ──
+    ("fakedsni-ts-r6-google", (
+        '--dpi-desync=fake,fakedsni --dpi-desync-repeats=6 '
+        '--dpi-desync-fooling=ts '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_www_google_com.bin"'
+    )),
+    ("fakedsni-badseq-r6-google", (
+        '--dpi-desync=fake,fakedsni --dpi-desync-repeats=6 '
+        '--dpi-desync-fooling=badseq '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_www_google_com.bin"'
+    )),
+    ("fakedsni-ts-r8-max", (
+        '--dpi-desync=fake,fakedsni --dpi-desync-repeats=8 '
+        '--dpi-desync-fooling=ts '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_max_ru.bin"'
+    )),
+    ("fakedsni-badseq-r11-4pda", (
+        '--dpi-desync=fake,fakedsni --dpi-desync-repeats=11 '
+        '--dpi-desync-fooling=badseq '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_4pda_to.bin"'
+    )),
+    ("fakedsni-md5sig-r6", (
+        '--dpi-desync=fake,fakedsni --dpi-desync-repeats=6 '
+        '--dpi-desync-fooling=md5sig '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_www_google_com.bin"'
+    )),
+
+    # ── sniext split & disorder variants (ALT7 style) ──
+    ("multisplit-sniext-679", (
+        '--dpi-desync=multisplit --dpi-desync-split-pos=2,sniext+1 '
+        '--dpi-desync-split-seqovl=679 '
+        '--dpi-desync-split-seqovl-pattern="{bin}tls_clienthello_www_google_com.bin"'
+    )),
+    ("multisplit-sniext-664-max", (
+        '--dpi-desync=multisplit --dpi-desync-split-pos=2,sniext+1 '
+        '--dpi-desync-split-seqovl=664 '
+        '--dpi-desync-split-seqovl-pattern="{bin}tls_clienthello_max_ru.bin"'
+    )),
+    ("split2-sniext", (
+        '--dpi-desync=split2 --dpi-desync-split-pos=sniext'
+    )),
+    ("split2-1-sniext", (
+        '--dpi-desync=split2 --dpi-desync-split-pos=1,sniext'
+    )),
+    ("disorder2-sniext", (
+        '--dpi-desync=disorder2 --dpi-desync-split-pos=sniext'
+    )),
+    ("disorder2-1-sniext", (
+        '--dpi-desync=disorder2 --dpi-desync-split-pos=1,sniext'
+    )),
+    ("fakesplit-sniext-r6-ts", (
+        '--dpi-desync=fake,split2 --dpi-desync-repeats=6 '
+        '--dpi-desync-split-pos=2,sniext+1 --dpi-desync-fooling=ts '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_www_google_com.bin"'
+    )),
+    ("fakedisorder-sniext-r8-badseq", (
+        '--dpi-desync=fake,disorder2 --dpi-desync-repeats=8 '
+        '--dpi-desync-split-pos=2,sniext+1 --dpi-desync-fooling=badseq '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_www_google_com.bin"'
+    )),
+
+    # ── autottl & explicit ttl variants ──
+    ("fakesplit-autottl2-r6-ts", (
+        '--dpi-desync=fake,split2 --dpi-desync-repeats=6 '
+        '--dpi-desync-split-pos=1,midsld --dpi-desync-fooling=ts '
+        '--dpi-desync-autottl=2 '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_www_google_com.bin"'
+    )),
+    ("fakedisorder-autottl2-r8-badseq", (
+        '--dpi-desync=fake,disorder2 --dpi-desync-repeats=8 '
+        '--dpi-desync-split-pos=1,midsld --dpi-desync-fooling=badseq '
+        '--dpi-desync-autottl=2 '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_www_google_com.bin"'
+    )),
+    ("fakedsplit-autottl-r6-ts", (
+        '--dpi-desync=fake,fakedsplit --dpi-desync-repeats=6 '
+        '--dpi-desync-fooling=ts --dpi-desync-autottl=2 '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_www_google_com.bin"'
+    )),
+    ("fakedsplit-ttl3-r6", (
+        '--dpi-desync=fake,fakedsplit --dpi-desync-repeats=6 '
+        '--dpi-desync-ttl=3 --dpi-desync-fooling=ts '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_www_google_com.bin"'
+    )),
+    ("fake-autottl-r6-google", (
+        '--dpi-desync=fake --dpi-desync-repeats=6 --dpi-desync-autottl=2 '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_www_google_com.bin"'
+    )),
+    ("multisplit-autottl-r6", (
+        '--dpi-desync=fake,multisplit --dpi-desync-repeats=6 '
+        '--dpi-desync-split-seqovl=681 --dpi-desync-split-pos=1 '
+        '--dpi-desync-autottl=2 '
+        '--dpi-desync-split-seqovl-pattern="{bin}tls_clienthello_www_google_com.bin"'
+    )),
+
+    # ── badseq increment variants (ALT8/ALT11) ──
+    ("fake-badseq-inc2-r6", (
+        '--dpi-desync=fake --dpi-desync-repeats=6 '
+        '--dpi-desync-fooling=badseq --dpi-desync-badseq-increment=2 '
+        '--dpi-desync-fake-tls-mod=none'
+    )),
+    ("fake-badseq-inc2-r8-google", (
+        '--dpi-desync=fake --dpi-desync-repeats=8 '
+        '--dpi-desync-fooling=badseq --dpi-desync-badseq-increment=2 '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_www_google_com.bin"'
+    )),
+    ("fakesplit-badseq-inc2-r6", (
+        '--dpi-desync=fake,split2 --dpi-desync-repeats=6 '
+        '--dpi-desync-split-pos=1,midsld --dpi-desync-fooling=badseq '
+        '--dpi-desync-badseq-increment=2 '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_www_google_com.bin"'
+    )),
+    ("fakedisorder-badseq-inc2-r8", (
+        '--dpi-desync=fake,disorder2 --dpi-desync-repeats=8 '
+        '--dpi-desync-split-pos=1,midsld --dpi-desync-fooling=badseq '
+        '--dpi-desync-badseq-increment=2 '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_www_google_com.bin"'
+    )),
+    ("fakedsplit-badseq-inc2-r8", (
+        '--dpi-desync=fake,fakedsplit --dpi-desync-repeats=8 '
+        '--dpi-desync-split-pos=1 --dpi-desync-fooling=badseq '
+        '--dpi-desync-badseq-increment=2 '
+        '--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com'
+    )),
+    ("multisplit-badseq-inc2-r8", (
+        '--dpi-desync=fake,multisplit --dpi-desync-repeats=8 '
+        '--dpi-desync-split-seqovl=681 --dpi-desync-split-pos=1 '
+        '--dpi-desync-fooling=badseq --dpi-desync-badseq-increment=2 '
+        '--dpi-desync-split-seqovl-pattern="{bin}tls_clienthello_www_google_com.bin"'
+    )),
+
+    # ── alternative payload templates (5ka, Max, Stun2) ──
+    ("multisplit-654-5ka", (
+        '--dpi-desync=multisplit --dpi-desync-split-seqovl=654 '
+        '--dpi-desync-split-pos=1 '
+        '--dpi-desync-split-seqovl-pattern="{bin}tls_clienthello_5ka_ru.bin"'
+    )),
+    ("multisplit-664-max", (
+        '--dpi-desync=multisplit --dpi-desync-split-seqovl=664 '
+        '--dpi-desync-split-pos=1 '
+        '--dpi-desync-split-seqovl-pattern="{bin}tls_clienthello_max_ru.bin"'
+    )),
+    ("multisplit-480-stun2", (
+        '--dpi-desync=multisplit --dpi-desync-split-seqovl=480 '
+        '--dpi-desync-split-pos=1 '
+        '--dpi-desync-split-seqovl-pattern="{bin}stun2.bin"'
+    )),
+    ("fakedsplit-ts-r6-5ka", (
+        '--dpi-desync=fake,fakedsplit --dpi-desync-repeats=6 '
+        '--dpi-desync-fooling=ts --dpi-desync-fakedsplit-pattern=0x00 '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_5ka_ru.bin"'
+    )),
+    ("fakedsplit-badseq-r8-5ka", (
+        '--dpi-desync=fake,fakedsplit --dpi-desync-repeats=8 '
+        '--dpi-desync-fooling=badseq --dpi-desync-fakedsplit-pattern=0x00 '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_5ka_ru.bin"'
+    )),
+    ("fakedsplit-ts-r8-stun2", (
+        '--dpi-desync=fake,fakedsplit --dpi-desync-repeats=8 '
+        '--dpi-desync-fooling=ts --dpi-desync-fakedsplit-pattern=0x00 '
+        '--dpi-desync-fake-tls="{bin}stun2.bin"'
+    )),
+    ("fake-r6-5ka", (
+        '--dpi-desync=fake --dpi-desync-repeats=6 '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_5ka_ru.bin"'
+    )),
+    ("fake-r8-stun2", (
+        '--dpi-desync=fake --dpi-desync-repeats=8 '
+        '--dpi-desync-fake-tls="{bin}stun2.bin"'
+    )),
+
+    # ── advanced TLS mod combinations (padenc, padsni, ya.ru) ──
+    ("multidisorder-padenc-rnd-r8", (
+        '--dpi-desync=fake,multidisorder --dpi-desync-split-pos=1,midsld '
+        '--dpi-desync-repeats=8 --dpi-desync-fooling=badseq '
+        '--dpi-desync-fake-tls-mod=rnd,dupsid,padenc,sni=www.google.com'
+    )),
+    ("multidisorder-padsni-rnd-r8", (
+        '--dpi-desync=fake,multidisorder --dpi-desync-split-pos=1,midsld '
+        '--dpi-desync-repeats=8 --dpi-desync-fooling=ts '
+        '--dpi-desync-fake-tls-mod=rnd,padsni,sni=www.google.com'
+    )),
+    ("multidisorder-rnd-4pda-r8", (
+        '--dpi-desync=fake,multidisorder --dpi-desync-split-pos=1,midsld '
+        '--dpi-desync-repeats=8 --dpi-desync-fooling=ts '
+        '--dpi-desync-fake-tls-mod=rnd,dupsid,sni=4pda.to'
+    )),
+    ("fakedsplit-padenc-rnd-r8", (
+        '--dpi-desync=fake,fakedsplit --dpi-desync-repeats=8 '
+        '--dpi-desync-fooling=badseq '
+        '--dpi-desync-fake-tls-mod=rnd,dupsid,padenc,sni=www.google.com'
+    )),
+    ("fakedsplit-rnd-yaru-r8", (
+        '--dpi-desync=fake,fakedsplit --dpi-desync-repeats=8 '
+        '--dpi-desync-fooling=ts '
+        '--dpi-desync-fake-tls-mod=rnd,dupsid,sni=ya.ru'
+    )),
+
+    # ── specialized fooling (datanoack, hopbyhop) ──
+    ("fakedsplit-datanoack-r6", (
+        '--dpi-desync=fake,fakedsplit --dpi-desync-repeats=6 '
+        '--dpi-desync-fooling=datanoack --dpi-desync-fakedsplit-pattern=0x00 '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_www_google_com.bin"'
+    )),
+    ("fakedsplit-hopbyhop-r6", (
+        '--dpi-desync=fake,fakedsplit --dpi-desync-repeats=6 '
+        '--dpi-desync-fooling=hopbyhop --dpi-desync-fakedsplit-pattern=0x00 '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_www_google_com.bin"'
+    )),
+    ("fakedisorder-hopbyhop-r6", (
+        '--dpi-desync=fake,disorder2 --dpi-desync-repeats=6 '
+        '--dpi-desync-split-pos=1,midsld --dpi-desync-fooling=hopbyhop '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_www_google_com.bin"'
+    )),
+    ("fakedisorder-hopbyhop2-r8", (
+        '--dpi-desync=fake,disorder2 --dpi-desync-repeats=8 '
+        '--dpi-desync-split-pos=1,midsld --dpi-desync-fooling=hopbyhop2 '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_www_google_com.bin"'
+    )),
+    ("fakedisorder-datanoack-r8", (
+        '--dpi-desync=fake,disorder2 --dpi-desync-repeats=8 '
+        '--dpi-desync-split-pos=1,midsld --dpi-desync-fooling=datanoack '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_www_google_com.bin"'
+    )),
+
+    # ── extended syndata & multisplit-fake combinations ──
+    ("syndata-pure-n3", (
+        '--dpi-desync=syndata --dpi-desync-any-protocol=1 --dpi-desync-cutoff=n3'
+    )),
+    ("syndata-split2-midsld", (
+        '--dpi-desync=syndata,split2 --dpi-desync-split-pos=1,midsld'
+    )),
+    ("syndata-fake-disorder-r6", (
+        '--dpi-desync=syndata,fake,disorder2 --dpi-desync-repeats=6 '
+        '--dpi-desync-split-pos=1,midsld --dpi-desync-fooling=ts '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_www_google_com.bin"'
+    )),
+    ("syndata-fake-fakedsplit-r6", (
+        '--dpi-desync=syndata,fake,fakedsplit --dpi-desync-repeats=6 '
+        '--dpi-desync-fooling=ts '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_www_google_com.bin"'
+    )),
+    ("syndata-multisplit-568", (
+        '--dpi-desync=syndata,multisplit --dpi-desync-split-seqovl=568 '
+        '--dpi-desync-split-pos=1 '
+        '--dpi-desync-split-seqovl-pattern="{bin}tls_clienthello_www_google_com.bin"'
+    )),
+    ("multisplit-fake-r8-ts-max", (
+        '--dpi-desync=fake,multisplit --dpi-desync-repeats=8 '
+        '--dpi-desync-split-seqovl=664 --dpi-desync-split-pos=1 '
+        '--dpi-desync-fooling=ts '
+        '--dpi-desync-split-seqovl-pattern="{bin}tls_clienthello_max_ru.bin" '
+        '--dpi-desync-fake-tls="{bin}stun2.bin"'
+    )),
+    ("multisplit-fake-r8-badseq-5ka", (
+        '--dpi-desync=fake,multisplit --dpi-desync-repeats=8 '
+        '--dpi-desync-split-seqovl=654 --dpi-desync-split-pos=1 '
+        '--dpi-desync-fooling=badseq '
+        '--dpi-desync-split-seqovl-pattern="{bin}tls_clienthello_5ka_ru.bin" '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_5ka_ru.bin"'
+    )),
+    ("multisplit-fake-r6-badseq-4pda", (
+        '--dpi-desync=fake,multisplit --dpi-desync-repeats=6 '
+        '--dpi-desync-split-seqovl=284 --dpi-desync-split-pos=1 '
+        '--dpi-desync-fooling=badseq '
+        '--dpi-desync-split-seqovl-pattern="{bin}tls_clienthello_4pda_to.bin" '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_4pda_to.bin"'
+    )),
+    ("multisplit-fake-r11-ts-google", (
+        '--dpi-desync=fake,multisplit --dpi-desync-repeats=11 '
+        '--dpi-desync-split-seqovl=681 --dpi-desync-split-pos=1 '
+        '--dpi-desync-fooling=ts '
+        '--dpi-desync-split-seqovl-pattern="{bin}tls_clienthello_www_google_com.bin" '
+        '--dpi-desync-fake-tls="{bin}tls_clienthello_www_google_com.bin"'
+    )),
 ]
 
 
@@ -2004,7 +2709,7 @@ class CreateWorker(QThread):
     success = pyqtSignal(str)  # filename of created bat
     finished = pyqtSignal()
 
-    def __init__(self, zapret_dir: Path, target_discord: bool = True, target_youtube: bool = True, num_configs: int = 1, multi_ping: bool = False):
+    def __init__(self, zapret_dir: Path, target_discord: bool = True, target_youtube: bool = True, num_configs: int = 1, multi_ping: bool = True):
         super().__init__()
         self.zapret_dir = zapret_dir
         self.target_discord = target_discord
@@ -2316,9 +3021,12 @@ class MainWindow(QMainWindow):
         self._color2 = "#ffffff"
         self._text_color = "#e0e0e0"
         self._check_update = True
+        self._auto_download = False
+        self._wallpaper_path: Path | None = None
         self._load_app_settings()
 
-        self._current_stylesheet = build_stylesheet(self._color1, self._color2, self._text_color)
+        has_wall = bool(self._wallpaper_path and self._wallpaper_path.exists())
+        self._current_stylesheet = build_stylesheet(self._color1, self._color2, self._text_color, has_wallpaper=has_wall)
         self.setStyleSheet(self._current_stylesheet)
         self.setWindowOpacity(self._transparency / 100.0)
 
@@ -2343,7 +3051,7 @@ class MainWindow(QMainWindow):
         self._auto_connect = False
         self._auto_start = False
         self._tg_auto_connect = False
-        self._multi_ping = False
+        self._multi_ping = True
 
         self._tg_manager = TgProxyManager.get(self._app_dir)
         self._tg_config = self._tg_manager.config
@@ -2429,7 +3137,7 @@ class MainWindow(QMainWindow):
                 self._auto_connect = d.get("auto_connect", False)
                 self._auto_start = d.get("auto_start", False)
                 self._tg_auto_connect = d.get("tg_auto_connect", False)
-                self._multi_ping = d.get("multi_ping", False)
+                self._multi_ping = d.get("multi_ping", True)
                 self._apply_auto_start()
                 if target_file == legacy_file:
                     self._save_settings()
@@ -2492,6 +3200,13 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         root = QWidget()
         self.setCentralWidget(root)
+
+        self._wallpaper_widget = WallpaperWidget(root, color1=self._color1)
+        self._wallpaper_widget.setGeometry(0, 0, WINDOW_W, WINDOW_H)
+        self._wallpaper_widget.lower()
+        if self._wallpaper_path and self._wallpaper_path.exists():
+            self._wallpaper_widget.set_wallpaper(self._wallpaper_path)
+
         vlay = QVBoxLayout(root)
         vlay.setContentsMargins(0, 0, 0, 0)
         vlay.setSpacing(0)
@@ -2725,7 +3440,7 @@ class MainWindow(QMainWindow):
 
         self._slider_num_configs = QSlider(Qt.Orientation.Horizontal)
         self._slider_num_configs.setMinimum(1)
-        self._slider_num_configs.setMaximum(5)
+        self._slider_num_configs.setMaximum(10)
         self._slider_num_configs.setValue(1)
         self._slider_num_configs.setTickPosition(QSlider.TickPosition.TicksBelow)
         self._slider_num_configs.setTickInterval(1)
@@ -2764,7 +3479,7 @@ class MainWindow(QMainWindow):
 
         ticks_row = QHBoxLayout()
         ticks_row.setContentsMargins(6, 0, 6, 0)
-        for val in ["1", "2", "3", "4", "5"]:
+        for val in [str(i) for i in range(1, 11)]:
             t_lbl = QLabel(val)
             t_lbl.setStyleSheet("color: #555; font-size: 10px; font-weight: 600; background: transparent;")
             t_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -3332,14 +4047,17 @@ class MainWindow(QMainWindow):
 
         # Category tabs (vertical)
         self._side_tab_ui = self._mk_side_tab("UI")
+        self._side_tab_set_ip = self._mk_side_tab("Set IP")
         self._side_tab_update = self._mk_side_tab("Update")
         self._side_tab_about = self._mk_side_tab("About")
 
         self._side_tab_ui.clicked.connect(lambda: self._switch_app_settings(0))
-        self._side_tab_update.clicked.connect(lambda: self._switch_app_settings(1))
-        self._side_tab_about.clicked.connect(lambda: self._switch_app_settings(2))
+        self._side_tab_set_ip.clicked.connect(lambda: self._switch_app_settings(1))
+        self._side_tab_update.clicked.connect(lambda: self._switch_app_settings(2))
+        self._side_tab_about.clicked.connect(lambda: self._switch_app_settings(3))
 
         left_lay.addWidget(self._side_tab_ui)
+        left_lay.addWidget(self._side_tab_set_ip)
         left_lay.addWidget(self._side_tab_update)
         left_lay.addStretch()
         left_lay.addWidget(self._side_tab_about)
@@ -3359,10 +4077,12 @@ class MainWindow(QMainWindow):
         right_lay.setSpacing(0)
 
         self._subpage_ui = self._build_settings_ui_subpage()
+        self._subpage_set_ip = self._build_settings_set_ip_subpage()
         self._subpage_update = self._build_settings_update_subpage()
         self._subpage_about = self._build_settings_about_subpage()
 
         right_lay.addWidget(self._subpage_ui, 1)
+        right_lay.addWidget(self._subpage_set_ip, 1)
         right_lay.addWidget(self._subpage_update, 1)
         right_lay.addWidget(self._subpage_about, 1)
 
@@ -3379,12 +4099,15 @@ class MainWindow(QMainWindow):
 
     def _switch_app_settings(self, idx: int):
         self._subpage_ui.setVisible(idx == 0)
-        self._subpage_update.setVisible(idx == 1)
-        self._subpage_about.setVisible(idx == 2)
-        for i, b in enumerate([self._side_tab_ui, self._side_tab_update, self._side_tab_about]):
+        self._subpage_set_ip.setVisible(idx == 1)
+        self._subpage_update.setVisible(idx == 2)
+        self._subpage_about.setVisible(idx == 3)
+        for i, b in enumerate([self._side_tab_ui, self._side_tab_set_ip, self._side_tab_update, self._side_tab_about]):
             b.setProperty("active", "true" if i == idx else "false")
             b.style().unpolish(b)
             b.style().polish(b)
+        if idx == 1:
+            self._refresh_set_ip_info()
 
     def _build_settings_ui_subpage(self) -> QWidget:
         w = QWidget()
@@ -3528,8 +4251,112 @@ class MainWindow(QMainWindow):
         def_row.addStretch()
         vlay.addLayout(def_row)
 
+        # ── Set as wallpaper ──
+        wall_row = QHBoxLayout()
+        wall_row.setSpacing(12)
+
+        self._btn_set_wallpaper = QPushButton("Set as wallpaper")
+        self._btn_set_wallpaper.setObjectName("actionBtn")
+        self._btn_set_wallpaper.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_set_wallpaper.setFixedWidth(120)
+        self._btn_set_wallpaper.setFixedHeight(34)
+        self._btn_set_wallpaper.clicked.connect(self._pick_wallpaper)
+
+        self._btn_clear_wallpaper = QPushButton("Clear")
+        self._btn_clear_wallpaper.setObjectName("actionBtn")
+        self._btn_clear_wallpaper.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_clear_wallpaper.setFixedWidth(70)
+        self._btn_clear_wallpaper.setFixedHeight(34)
+        self._btn_clear_wallpaper.clicked.connect(self._clear_wallpaper_clicked)
+        self._btn_clear_wallpaper.setVisible(bool(self._wallpaper_path and self._wallpaper_path.exists()))
+
+        self._lbl_wallpaper_info = QLabel(f"Add a photo or GIF to the background (recommended: {WINDOW_W}x{WINDOW_H})")
+        self._lbl_wallpaper_info.setObjectName("infoLbl")
+
+        wall_row.addWidget(self._btn_set_wallpaper)
+        wall_row.addWidget(self._btn_clear_wallpaper)
+        wall_row.addWidget(self._lbl_wallpaper_info)
+        wall_row.addStretch()
+        vlay.addLayout(wall_row)
+
         vlay.addStretch()
         self._update_color_previews()
+        return w
+
+    def _build_settings_set_ip_subpage(self) -> QWidget:
+        w = QWidget()
+        vlay = QVBoxLayout(w)
+        vlay.setContentsMargins(0, 0, 0, 0)
+        vlay.setSpacing(16)
+
+        lbl = QLabel("SET IP")
+        lbl.setObjectName("sectionLbl")
+        vlay.addWidget(lbl)
+
+        desc = QLabel("Add custom IP addresses or domain names to list-general.txt hostlist.")
+        desc.setObjectName("infoLbl")
+        vlay.addWidget(desc)
+
+        # ── Input row: QLineEdit + Add button ──
+        inp_box = QWidget()
+        inp_lay = QHBoxLayout(inp_box)
+        inp_lay.setContentsMargins(0, 0, 0, 0)
+        inp_lay.setSpacing(10)
+
+        self._inp_custom_ip = QLineEdit()
+        self._inp_custom_ip.setPlaceholderText("Enter IP or domain (e.g. soundcloud.com)...")
+        self._inp_custom_ip.setFixedHeight(34)
+        self._inp_custom_ip.returnPressed.connect(self._add_custom_ip)
+
+        self._btn_add_ip = QPushButton("Add")
+        self._btn_add_ip.setObjectName("actionBtn")
+        self._btn_add_ip.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_add_ip.setFixedWidth(80)
+        self._btn_add_ip.setFixedHeight(34)
+        self._btn_add_ip.clicked.connect(self._add_custom_ip)
+
+        inp_lay.addWidget(self._inp_custom_ip, 1)
+        inp_lay.addWidget(self._btn_add_ip)
+        vlay.addWidget(inp_box)
+
+        # ── SoundCloud Button ──
+        sc_box = QWidget()
+        sc_lay = QHBoxLayout(sc_box)
+        sc_lay.setContentsMargins(0, 0, 0, 0)
+        sc_lay.setSpacing(10)
+
+        self._btn_add_soundcloud = QPushButton("Add IP SoundCloud")
+        self._btn_add_soundcloud.setObjectName("actionBtn")
+        self._btn_add_soundcloud.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_add_soundcloud.setFixedHeight(34)
+        self._btn_add_soundcloud.clicked.connect(self._add_soundcloud_ips)
+
+        sc_desc = QLabel("Batch add all required SoundCloud domains to list-general.txt")
+        sc_desc.setObjectName("infoLbl")
+
+        sc_lay.addWidget(self._btn_add_soundcloud)
+        sc_lay.addWidget(sc_desc)
+        sc_lay.addStretch()
+        vlay.addWidget(sc_box)
+
+        # ── Feedback label ──
+        self._lbl_set_ip_feedback = QLabel("")
+        self._lbl_set_ip_feedback.setStyleSheet("font-size: 12px; background: transparent;")
+        vlay.addWidget(self._lbl_set_ip_feedback)
+
+        # ── List info & preview ──
+        self._lbl_set_ip_count = QLabel("list-general.txt entries: 0")
+        self._lbl_set_ip_count.setStyleSheet("font-size: 12px; font-weight: 600; background: transparent;")
+        vlay.addWidget(self._lbl_set_ip_count)
+
+        self._txt_set_ip_preview = QTextEdit()
+        self._txt_set_ip_preview.setObjectName("settingText")
+        self._txt_set_ip_preview.setReadOnly(True)
+        self._txt_set_ip_preview.setFixedHeight(180)
+        vlay.addWidget(self._txt_set_ip_preview)
+
+        vlay.addStretch()
+        self._refresh_set_ip_info()
         return w
 
     def _build_settings_update_subpage(self) -> QWidget:
@@ -3552,7 +4379,7 @@ class MainWindow(QMainWindow):
         sw_top.setSpacing(14)
 
         sw_title = QLabel("check-update")
-        sw_title.setStyleSheet("font-size: 13px; font-weight: 600; background: transparent; min-width: 95px;")
+        sw_title.setStyleSheet("font-size: 13px; font-weight: 600; background: transparent; min-width: 105px;")
 
         self._switch_check_update = ToggleSwitch(checked=self._check_update)
         self._switch_check_update.set_colors(self._color2, self._color1)
@@ -3571,6 +4398,36 @@ class MainWindow(QMainWindow):
         sw_desc.setObjectName("infoLbl")
         sw_lay.addWidget(sw_desc)
         vlay.addWidget(sw_box)
+
+        # ── Auto-download toggle ──
+        auto_box = QWidget()
+        auto_lay = QVBoxLayout(auto_box)
+        auto_lay.setContentsMargins(0, 0, 0, 0)
+        auto_lay.setSpacing(6)
+
+        auto_top = QHBoxLayout()
+        auto_top.setSpacing(14)
+
+        auto_title = QLabel("auto-download")
+        auto_title.setStyleSheet("font-size: 13px; font-weight: 600; background: transparent; min-width: 105px;")
+
+        self._switch_auto_download = ToggleSwitch(checked=self._auto_download)
+        self._switch_auto_download.set_colors(self._color2, self._color1)
+        self._switch_auto_download.toggled.connect(self._on_auto_download_toggled)
+
+        self._lbl_auto_download_state = QLabel("Enabled" if self._auto_download else "Disabled")
+        self._lbl_auto_download_state.setStyleSheet("font-size: 12px; font-weight: 600; background: transparent;")
+
+        auto_top.addWidget(auto_title)
+        auto_top.addWidget(self._switch_auto_download)
+        auto_top.addWidget(self._lbl_auto_download_state)
+        auto_top.addStretch()
+        auto_lay.addLayout(auto_top)
+
+        auto_desc = QLabel("Prompt to automatically download and self-replace executable when an update is found.")
+        auto_desc.setObjectName("infoLbl")
+        auto_lay.addWidget(auto_desc)
+        vlay.addWidget(auto_box)
 
         # ── Version details ──
         info_box = QWidget()
@@ -3720,6 +4577,7 @@ class MainWindow(QMainWindow):
             self._input_transparency.blockSignals(False)
 
         self.setWindowOpacity(1.0)
+        self._clear_wallpaper()
         self._update_color_previews()
         self._apply_theme()
         self._save_app_settings()
@@ -3749,13 +4607,32 @@ class MainWindow(QMainWindow):
         )
         self._lbl_hex_text_color.setText(self._text_color.upper())
 
+        if hasattr(self, "_lbl_wallpaper_info"):
+            if self._wallpaper_path and self._wallpaper_path.exists():
+                self._lbl_wallpaper_info.setText(
+                    f"Add a photo or GIF to the background (recommended: {WINDOW_W}x{WINDOW_H}) • Active: {self._wallpaper_path.name}"
+                )
+                if hasattr(self, "_btn_clear_wallpaper"):
+                    self._btn_clear_wallpaper.setVisible(True)
+            else:
+                self._lbl_wallpaper_info.setText(
+                    f"Add a photo or GIF to the background (recommended: {WINDOW_W}x{WINDOW_H})"
+                )
+                if hasattr(self, "_btn_clear_wallpaper"):
+                    self._btn_clear_wallpaper.setVisible(False)
+
     def _apply_theme(self):
-        self._current_stylesheet = build_stylesheet(self._color1, self._color2, self._text_color)
+        has_wall = bool(self._wallpaper_path and self._wallpaper_path.exists())
+        self._current_stylesheet = build_stylesheet(self._color1, self._color2, self._text_color, has_wallpaper=has_wall)
         self.setStyleSheet(self._current_stylesheet)
         self.setWindowOpacity(self._transparency / 100.0)
         self._update_color_previews()
+        if hasattr(self, "_wallpaper_widget"):
+            self._wallpaper_widget.set_base_color(self._color1)
         if hasattr(self, "_switch_check_update"):
             self._switch_check_update.set_colors(self._color2, self._color1)
+        if hasattr(self, "_switch_auto_download"):
+            self._switch_auto_download.set_colors(self._color2, self._color1)
         if hasattr(self, "_power_btn") and hasattr(self._power_btn, "set_theme"):
             self._power_btn.set_theme(self._color1, self._color2)
         if hasattr(self, "_lbl_about_github"):
@@ -3777,6 +4654,13 @@ class MainWindow(QMainWindow):
             self._lbl_check_update_state.setText("Enabled" if checked else "Disabled")
         self._save_app_settings()
 
+    def _on_auto_download_toggled(self, checked: bool):
+        self._auto_download = checked
+        if hasattr(self, "_lbl_auto_download_state"):
+            self._lbl_auto_download_state.setText("Enabled" if checked else "Disabled")
+        self._save_app_settings()
+        self._log(f"Auto-download {'enabled' if checked else 'disabled'}", "dim")
+
     def _manual_check_update(self):
         self._btn_check_update_now.setEnabled(False)
         self._lbl_update_feedback.setText("Checking GitHub...")
@@ -3785,13 +4669,13 @@ class MainWindow(QMainWindow):
         self._manual_worker.finished.connect(self._on_manual_check_finished)
         self._manual_worker.start()
 
-    def _on_manual_check_finished(self, success: bool, tag: str):
+    def _on_manual_check_finished(self, success: bool, tag: str, download_url: str = ""):
         self._btn_check_update_now.setEnabled(True)
         if success and tag:
             if is_newer_version(tag, APP_VERSION):
                 self._lbl_update_feedback.setText(f"New update found: {tag}")
                 self._lbl_update_feedback.setStyleSheet("color: #4cd964; font-size: 12px; background: transparent;")
-                self._show_update_dialog(tag)
+                self._show_update_dialog(tag, download_url=download_url)
             else:
                 self._lbl_update_feedback.setText(f"You have the latest version (v{APP_VERSION}).")
                 self._lbl_update_feedback.setStyleSheet("color: #888888; font-size: 12px; background: transparent;")
@@ -3806,12 +4690,19 @@ class MainWindow(QMainWindow):
         self._startup_worker.finished.connect(self._on_startup_check_finished)
         self._startup_worker.start()
 
-    def _on_startup_check_finished(self, success: bool, tag: str):
+    def _on_startup_check_finished(self, success: bool, tag: str, download_url: str = ""):
         if success and tag and is_newer_version(tag, APP_VERSION):
-            self._show_update_dialog(tag)
+            self._show_update_dialog(tag, download_url=download_url)
 
-    def _show_update_dialog(self, new_tag: str):
-        dlg = NewUpdateDialog(new_tag, APP_VERSION, self._current_stylesheet, self)
+    def _show_update_dialog(self, new_tag: str, download_url: str = ""):
+        dlg = NewUpdateDialog(
+            new_tag,
+            APP_VERSION,
+            self._current_stylesheet,
+            self,
+            auto_download=self._auto_download,
+            download_url=download_url,
+        )
         dlg.exec()
 
     def _load_app_settings(self):
@@ -3821,6 +4712,8 @@ class MainWindow(QMainWindow):
         self._color2 = "#ffffff"
         self._text_color = "#e0e0e0"
         self._check_update = True
+        self._auto_download = False
+        self._wallpaper_path: Path | None = None
 
         if self._app_settings_file.exists():
             try:
@@ -3830,6 +4723,12 @@ class MainWindow(QMainWindow):
                 self._color2 = str(data.get("color2", "#ffffff")).strip().lower()
                 self._text_color = str(data.get("text_color", "#e0e0e0")).strip().lower()
                 self._check_update = bool(data.get("check_update", True))
+                self._auto_download = bool(data.get("auto_download", False))
+                wp = data.get("wallpaper")
+                if wp:
+                    wp_p = self._settings_dir / str(wp)
+                    if wp_p.exists():
+                        self._wallpaper_path = wp_p
             except Exception:
                 pass
         else:
@@ -3844,6 +4743,8 @@ class MainWindow(QMainWindow):
             "color2": self._color2,
             "text_color": self._text_color,
             "check_update": self._check_update,
+            "auto_download": self._auto_download,
+            "wallpaper": self._wallpaper_path.name if (self._wallpaper_path and self._wallpaper_path.exists()) else None,
         }
         try:
             self._app_settings_file.parent.mkdir(parents=True, exist_ok=True)
@@ -3853,6 +4754,208 @@ class MainWindow(QMainWindow):
             )
         except Exception:
             pass
+
+    # ── Wallpaper actions ──
+
+    def _pick_wallpaper(self):
+        file_filter = (
+            "All Supported Files (*.png *.jpg *.jpeg *.bmp *.webp *.gif *.mp4 *.avi *.mkv *.webm *.mov);;"
+            "Images (*.png *.jpg *.jpeg *.bmp *.webp);;"
+            "GIF (*.gif);;"
+            "Videos (*.mp4 *.mkv *.avi *.webm *.mov);;"
+            "All Files (*.*)"
+        )
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Wallpaper (Image, GIF, Video)",
+            "",
+            file_filter
+        )
+        if not file_path:
+            return
+
+        src = Path(file_path)
+        if not src.exists():
+            return
+
+        try:
+            self._settings_dir.mkdir(parents=True, exist_ok=True)
+            for old_f in self._settings_dir.glob("wallpaper.*"):
+                try:
+                    old_f.unlink()
+                except Exception:
+                    pass
+
+            dest = self._settings_dir / f"wallpaper{src.suffix.lower()}"
+            shutil.copy2(src, dest)
+            self._wallpaper_path = dest
+            self._save_app_settings()
+            self._apply_wallpaper()
+            self._apply_theme()
+        except Exception:
+            pass
+
+    def _clear_wallpaper_clicked(self):
+        self._clear_wallpaper()
+        self._save_app_settings()
+        self._apply_theme()
+
+    def _clear_wallpaper(self):
+        if hasattr(self, "_settings_dir") and self._settings_dir.exists():
+            for old_f in self._settings_dir.glob("wallpaper.*"):
+                try:
+                    old_f.unlink()
+                except Exception:
+                    pass
+        self._wallpaper_path = None
+        if hasattr(self, "_wallpaper_widget"):
+            self._wallpaper_widget.clear_wallpaper()
+
+    def _apply_wallpaper(self):
+        if hasattr(self, "_wallpaper_widget") and self._wallpaper_path and self._wallpaper_path.exists():
+            self._wallpaper_widget.set_wallpaper(self._wallpaper_path)
+
+    # ── Set IP actions ──
+
+    def _get_list_general_paths(self) -> list[Path]:
+        paths: list[Path] = []
+        if hasattr(self, "_zapret_dir") and self._zapret_dir:
+            p1 = self._zapret_dir / "lists" / "list-general.txt"
+            if p1.exists() and p1 not in paths:
+                paths.append(p1)
+
+        if hasattr(self, "_app_dir") and self._app_dir:
+            for p in self._app_dir.rglob("list-general.txt"):
+                if p.is_file() and p not in paths:
+                    paths.append(p)
+
+        if not paths:
+            fallback = self._zapret_dir / "lists" / "list-general.txt"
+            fallback.parent.mkdir(parents=True, exist_ok=True)
+            fallback.touch(exist_ok=True)
+            paths.append(fallback)
+
+        return paths
+
+    def _read_list_general_entries(self, path: Path) -> list[str]:
+        if not path.exists():
+            return []
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+            return [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
+        except Exception:
+            return []
+
+    def _sanitize_ip_or_domain(self, text: str) -> str:
+        s = text.strip()
+        if not s:
+            return ""
+        if "://" in s:
+            try:
+                parsed = urlparse(s)
+                s = parsed.netloc or parsed.path
+            except Exception:
+                pass
+        s = s.split("/")[0].strip()
+        return s
+
+    def _add_custom_ip(self):
+        val = self._sanitize_ip_or_domain(self._inp_custom_ip.text())
+        if not val:
+            self._lbl_set_ip_feedback.setText("Please enter a valid IP address or domain.")
+            self._lbl_set_ip_feedback.setStyleSheet("color: #ffaa00; font-size: 12px; background: transparent;")
+            return
+
+        paths = self._get_list_general_paths()
+        if not paths:
+            self._lbl_set_ip_feedback.setText("Error: list-general.txt not found.")
+            self._lbl_set_ip_feedback.setStyleSheet("color: #ff5555; font-size: 12px; background: transparent;")
+            return
+
+        existing = [e.lower() for e in self._read_list_general_entries(paths[0])]
+        if val.lower() in existing:
+            self._lbl_set_ip_feedback.setText(f"Entry '{val}' already exists in list-general.txt.")
+            self._lbl_set_ip_feedback.setStyleSheet("color: #ffaa00; font-size: 12px; background: transparent;")
+            return
+
+        for p in paths:
+            try:
+                content = p.read_text(encoding="utf-8", errors="ignore")
+                if content and not content.endswith("\n"):
+                    content += "\n"
+                content += val + "\n"
+                p.write_text(content, encoding="utf-8")
+            except Exception as e:
+                self._lbl_set_ip_feedback.setText(f"Error saving to {p.name}: {e}")
+                self._lbl_set_ip_feedback.setStyleSheet("color: #ff5555; font-size: 12px; background: transparent;")
+                return
+
+        self._lbl_set_ip_feedback.setText(f"Successfully added '{val}' to list-general.txt")
+        self._lbl_set_ip_feedback.setStyleSheet("color: #55ff55; font-size: 12px; background: transparent;")
+        self._inp_custom_ip.clear()
+        self._refresh_set_ip_info()
+
+    def _add_soundcloud_ips(self):
+        paths = self._get_list_general_paths()
+        if not paths:
+            self._lbl_set_ip_feedback.setText("Error: list-general.txt not found.")
+            self._lbl_set_ip_feedback.setStyleSheet("color: #ff5555; font-size: 12px; background: transparent;")
+            return
+
+        existing = set(e.lower() for e in self._read_list_general_entries(paths[0]))
+        to_add = []
+        already_count = 0
+
+        for domain in SOUNDCLOUD_DOMAINS:
+            d_clean = domain.strip()
+            if not d_clean:
+                continue
+            if d_clean.lower() in existing or d_clean.lower() in [x.lower() for x in to_add]:
+                already_count += 1
+            else:
+                to_add.append(d_clean)
+                existing.add(d_clean.lower())
+
+        if not to_add:
+            self._lbl_set_ip_feedback.setText(
+                f"All SoundCloud entries already exist in list-general.txt ({already_count} entries verified)."
+            )
+            self._lbl_set_ip_feedback.setStyleSheet("color: #ffaa00; font-size: 12px; background: transparent;")
+            return
+
+        for p in paths:
+            try:
+                content = p.read_text(encoding="utf-8", errors="ignore")
+                if content and not content.endswith("\n"):
+                    content += "\n"
+                content += "\n".join(to_add) + "\n"
+                p.write_text(content, encoding="utf-8")
+            except Exception as e:
+                self._lbl_set_ip_feedback.setText(f"Error writing to {p.name}: {e}")
+                self._lbl_set_ip_feedback.setStyleSheet("color: #ff5555; font-size: 12px; background: transparent;")
+                return
+
+        msg = f"Added {len(to_add)} SoundCloud entries to list-general.txt"
+        if already_count > 0:
+            msg += f" ({already_count} already existed)"
+        self._lbl_set_ip_feedback.setText(msg)
+        self._lbl_set_ip_feedback.setStyleSheet("color: #55ff55; font-size: 12px; background: transparent;")
+        self._refresh_set_ip_info()
+
+    def _refresh_set_ip_info(self):
+        if not hasattr(self, "_txt_set_ip_preview"):
+            return
+        paths = self._get_list_general_paths()
+        if not paths:
+            self._lbl_set_ip_count.setText("list-general.txt not found")
+            self._txt_set_ip_preview.setPlainText("")
+            return
+        entries = self._read_list_general_entries(paths[0])
+        self._lbl_set_ip_count.setText(f"list-general.txt ({paths[0].name}) — {len(entries)} entries:")
+        self._txt_set_ip_preview.setPlainText("\n".join(entries))
+        sb = self._txt_set_ip_preview.verticalScrollBar()
+        if sb:
+            sb.setValue(sb.maximum())
 
     # ── TG WS Proxy Logic ─────────────────────────────────────────
 
@@ -4189,6 +5292,12 @@ class MainWindow(QMainWindow):
             self._act_tg_off.setVisible(is_tg)
 
     # ── Window events ─────────────────────────────────────────────
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if hasattr(self, "_wallpaper_widget"):
+            self._wallpaper_widget.setGeometry(0, 0, self.width(), self.height())
+            self._wallpaper_widget.lower()
 
     def showEvent(self, e):
         super().showEvent(e)
