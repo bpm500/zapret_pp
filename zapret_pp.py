@@ -88,7 +88,7 @@ from tg_proxy_service import (
 # ══════════════════════════════════════════════════════════════════
 
 APP_NAME = "zapret++"
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.6"
 WINDOW_W, WINDOW_H = 800, 600  # 4:3
 
 # ══════════════════════════════════════════════════════════════════
@@ -2061,6 +2061,15 @@ SOUNDCLOUD_DOMAINS = [
     "playback.media-streaming.soundcloud.cloud",
 ]
 
+SPEEDTEST_DOMAINS = [
+    "speedtest.net",
+    "c.speedtest.net",
+    "speedtestcustom.com",
+    "usbrowserspeed.com",
+    "ooklaserver.net",
+    "cdnst.net",
+]
+
 
 # ══════════════════════════════════════════════════════════════════
 #  CREATE WORKER — auto-generate bat files
@@ -3165,24 +3174,11 @@ class MainWindow(QMainWindow):
             pass
 
     def _apply_auto_start(self):
-        # Clean up legacy Run registry entry if present
-        try:
-            key = winreg.OpenKey(
-                winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE
-            )
-            try:
-                winreg.DeleteValue(key, APP_NAME)
-            except FileNotFoundError:
-                pass
-            winreg.CloseKey(key)
-        except Exception:
-            pass
-
-        # Apply Task Scheduler autostart
+        # Apply Task Scheduler autostart and clean up legacy entries
         if self._auto_start:
-            enable_autostart()
+            enable_autostart(elevate=False)
         else:
-            disable_autostart()
+            disable_autostart(elevate=False)
 
     def _sync_autostart_ui(self):
         """Dynamically sync checkbox with real Windows Task Scheduler state."""
@@ -4258,7 +4254,7 @@ class MainWindow(QMainWindow):
         self._btn_set_wallpaper = QPushButton("Set as wallpaper")
         self._btn_set_wallpaper.setObjectName("actionBtn")
         self._btn_set_wallpaper.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self._btn_set_wallpaper.setFixedWidth(120)
+        self._btn_set_wallpaper.setFixedWidth(125)
         self._btn_set_wallpaper.setFixedHeight(34)
         self._btn_set_wallpaper.clicked.connect(self._pick_wallpaper)
 
@@ -4270,7 +4266,7 @@ class MainWindow(QMainWindow):
         self._btn_clear_wallpaper.clicked.connect(self._clear_wallpaper_clicked)
         self._btn_clear_wallpaper.setVisible(bool(self._wallpaper_path and self._wallpaper_path.exists()))
 
-        self._lbl_wallpaper_info = QLabel(f"Add a photo or GIF to the background (recommended: {WINDOW_W}x{WINDOW_H})")
+        self._lbl_wallpaper_info = QLabel(f"Add a photo or GIF to the background (recommended: 800x600)")
         self._lbl_wallpaper_info.setObjectName("infoLbl")
 
         wall_row.addWidget(self._btn_set_wallpaper)
@@ -4338,6 +4334,26 @@ class MainWindow(QMainWindow):
         sc_lay.addWidget(sc_desc)
         sc_lay.addStretch()
         vlay.addWidget(sc_box)
+
+        # ── SpeedTest Button ──
+        st_box = QWidget()
+        st_lay = QHBoxLayout(st_box)
+        st_lay.setContentsMargins(0, 0, 0, 0)
+        st_lay.setSpacing(10)
+
+        self._btn_add_speedtest = QPushButton("Add IP SpeedTest")
+        self._btn_add_speedtest.setObjectName("actionBtn")
+        self._btn_add_speedtest.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_add_speedtest.setFixedHeight(34)
+        self._btn_add_speedtest.clicked.connect(self._add_speedtest_ips)
+
+        st_desc = QLabel("Batch add all required SpeedTest domains to list-general.txt")
+        st_desc.setObjectName("infoLbl")
+
+        st_lay.addWidget(self._btn_add_speedtest)
+        st_lay.addWidget(st_desc)
+        st_lay.addStretch()
+        vlay.addWidget(st_box)
 
         # ── Feedback label ──
         self._lbl_set_ip_feedback = QLabel("")
@@ -4942,6 +4958,53 @@ class MainWindow(QMainWindow):
         self._lbl_set_ip_feedback.setStyleSheet("color: #55ff55; font-size: 12px; background: transparent;")
         self._refresh_set_ip_info()
 
+    def _add_speedtest_ips(self):
+        paths = self._get_list_general_paths()
+        if not paths:
+            self._lbl_set_ip_feedback.setText("Error: list-general.txt not found.")
+            self._lbl_set_ip_feedback.setStyleSheet("color: #ff5555; font-size: 12px; background: transparent;")
+            return
+
+        existing = set(e.lower() for e in self._read_list_general_entries(paths[0]))
+        to_add = []
+        already_count = 0
+
+        for domain in SPEEDTEST_DOMAINS:
+            d_clean = domain.strip()
+            if not d_clean:
+                continue
+            if d_clean.lower() in existing or d_clean.lower() in [x.lower() for x in to_add]:
+                already_count += 1
+            else:
+                to_add.append(d_clean)
+                existing.add(d_clean.lower())
+
+        if not to_add:
+            self._lbl_set_ip_feedback.setText(
+                f"All SpeedTest entries already exist in list-general.txt ({already_count} entries verified)."
+            )
+            self._lbl_set_ip_feedback.setStyleSheet("color: #ffaa00; font-size: 12px; background: transparent;")
+            return
+
+        for p in paths:
+            try:
+                content = p.read_text(encoding="utf-8", errors="ignore")
+                if content and not content.endswith("\n"):
+                    content += "\n"
+                content += "\n".join(to_add) + "\n"
+                p.write_text(content, encoding="utf-8")
+            except Exception as e:
+                self._lbl_set_ip_feedback.setText(f"Error writing to {p.name}: {e}")
+                self._lbl_set_ip_feedback.setStyleSheet("color: #ff5555; font-size: 12px; background: transparent;")
+                return
+
+        msg = f"Added {len(to_add)} SpeedTest entries to list-general.txt"
+        if already_count > 0:
+            msg += f" ({already_count} already existed)"
+        self._lbl_set_ip_feedback.setText(msg)
+        self._lbl_set_ip_feedback.setStyleSheet("color: #55ff55; font-size: 12px; background: transparent;")
+        self._refresh_set_ip_info()
+
     def _refresh_set_ip_info(self):
         if not hasattr(self, "_txt_set_ip_preview"):
             return
@@ -5533,7 +5596,7 @@ class MainWindow(QMainWindow):
 
     def _on_autostart_changed(self, v: bool):
         if v:
-            success = enable_autostart()
+            success = enable_autostart(elevate=True)
             if not success:
                 self._chk_autostart.blockSignals(True)
                 self._chk_autostart.setChecked(False)
@@ -5546,7 +5609,15 @@ class MainWindow(QMainWindow):
             self._save_settings()
             self._log("Autostart enabled via Task Scheduler", "dim")
         else:
-            disable_autostart()
+            success = disable_autostart(elevate=True)
+            if not success:
+                self._chk_autostart.blockSignals(True)
+                self._chk_autostart.setChecked(True)
+                self._chk_autostart.blockSignals(False)
+                self._auto_start = True
+                self._save_settings()
+                self._log("Failed to disable autostart (admin rights required)", "white")
+                return
             self._auto_start = False
             self._save_settings()
             self._log("Autostart disabled via Task Scheduler", "dim")
